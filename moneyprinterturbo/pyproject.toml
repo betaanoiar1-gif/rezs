@@ -17,6 +17,7 @@ dependencies = [
     "streamlit==1.59.1",
     "streamlit-tour==1.1.0",
     "edge-tts==7.2.7",
+    "espeakng-loader==0.2.4",
     "fastapi==0.136.3",
     "uvicorn==0.32.1",
     "openai==2.24.0",

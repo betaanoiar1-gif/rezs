@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ctypes
 import io
 import inspect
 import json
@@ -15,6 +16,7 @@ import time
 import unicodedata
 import wave
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Union
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape, unescape
@@ -32,6 +34,9 @@ from app.config import config
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
+_LOCAL_ESPEAK_LOCK = threading.Lock()
+_LOCAL_ESPEAK_LIBRARY = None
+_LOCAL_ESPEAK_SAMPLE_RATE = None
 _SILICONFLOW_TTS_TIMEOUT_SECONDS = (10, 300)  # connect, read
 _MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 _MIMO_DEFAULT_TTS_MODEL = "mimo-v2.5-tts"
@@ -437,6 +442,10 @@ def is_kokoro_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("kokoro:")
 
 
+def is_local_espeak_voice(voice_name: str | None) -> bool:
+    return (voice_name or "").startswith("local_espeak:")
+
+
 def is_fish_audio_voice(voice_name: str) -> bool:
     return (voice_name or "").startswith("fish_audio:")
 
@@ -602,6 +611,11 @@ def _single_tts(
             audio_duration_seconds=duration_seconds,
         )
 
+    if is_local_espeak_voice(voice_name):
+        local_voice = voice_name.split(":", 1)[1].strip()
+        return local_espeak_tts(
+            text, local_voice, voice_file, voice_rate, voice_volume
+        )
     if is_azure_v2_voice(voice_name):
         return azure_tts_v2(
             text,
@@ -1055,6 +1069,127 @@ def _tts_with_pauses(
 
         combined_submaker.duration = cumulative_samples / float(SAMPLE_RATE)
         return combined_submaker
+
+
+def _get_local_espeak_library():
+    """Initialize eSpeak NG once; its callback and voice state are process-global."""
+    global _LOCAL_ESPEAK_LIBRARY, _LOCAL_ESPEAK_SAMPLE_RATE
+    if _LOCAL_ESPEAK_LIBRARY is not None:
+        return _LOCAL_ESPEAK_LIBRARY, _LOCAL_ESPEAK_SAMPLE_RATE
+
+    import espeakng_loader
+
+    library = espeakng_loader.load_library()
+    if library is None:
+        raise RuntimeError("espeak-ng shared library could not be loaded")
+    library.espeak_Initialize.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    library.espeak_Initialize.restype = ctypes.c_int
+    library.espeak_SetVoiceByName.argtypes = [ctypes.c_char_p]
+    library.espeak_SetVoiceByName.restype = ctypes.c_int
+    library.espeak_SetParameter.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    library.espeak_SetParameter.restype = ctypes.c_int
+    library.espeak_Synth.argtypes = [
+        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_int,
+        ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_uint), ctypes.c_void_p,
+    ]
+    library.espeak_Synth.restype = ctypes.c_int
+    library.espeak_Synchronize.argtypes = []
+    library.espeak_Synchronize.restype = ctypes.c_int
+
+    sample_rate = library.espeak_Initialize(
+        1, 0, espeakng_loader.get_data_path().encode("utf-8"), 0
+    )
+    if sample_rate <= 0:
+        raise RuntimeError("espeak-ng initialization failed")
+    _LOCAL_ESPEAK_LIBRARY = library
+    _LOCAL_ESPEAK_SAMPLE_RATE = sample_rate
+    return library, sample_rate
+
+
+def local_espeak_tts(
+    text: str,
+    voice: str,
+    voice_file: str,
+    voice_rate: float = 1.0,
+    voice_volume: float = 1.0,
+) -> Union[SubMaker, None]:
+    """Synthesize real offline PCM speech through the bundled eSpeak NG library."""
+    clean_text = (text or "").strip()
+    local_voice = (voice or "").strip()
+    if not clean_text or not local_voice:
+        logger.error("local eSpeak requires non-empty text and voice")
+        return None
+
+    samples = bytearray()
+    callback_type = ctypes.CFUNCTYPE(
+        ctypes.c_int, ctypes.POINTER(ctypes.c_short), ctypes.c_int, ctypes.c_void_p
+    )
+
+    def receive_audio(wav, sample_count, _events):
+        if wav and sample_count > 0:
+            samples.extend(ctypes.string_at(wav, sample_count * ctypes.sizeof(ctypes.c_short)))
+        return 0
+
+    callback = callback_type(receive_audio)
+    try:
+        with _LOCAL_ESPEAK_LOCK:
+            library, sample_rate = _get_local_espeak_library()
+            library.espeak_SetSynthCallback.argtypes = [callback_type]
+            library.espeak_SetSynthCallback.restype = None
+            library.espeak_SetSynthCallback(callback)
+            if library.espeak_SetVoiceByName(local_voice.encode("utf-8")) != 0:
+                logger.error(f"unknown local eSpeak voice: {local_voice}")
+                return None
+            rate = max(80, min(450, round(175 * float(voice_rate or 1.0))))
+            volume = max(0, min(200, round(100 * float(voice_volume or 1.0))))
+            library.espeak_SetParameter(1, rate, 0)
+            library.espeak_SetParameter(2, volume, 0)
+            encoded = clean_text.encode("utf-8")
+            unique_id = ctypes.c_uint(0)
+            buffer = ctypes.create_string_buffer(encoded + b"\0")
+            result = library.espeak_Synth(
+                ctypes.cast(buffer, ctypes.c_void_p), len(encoded) + 1,
+                0, 1, 0, 1, ctypes.byref(unique_id), None,
+            )
+            if result != 0 or library.espeak_Synchronize() != 0:
+                logger.error(f"local eSpeak synthesis failed with code: {result}")
+                return None
+
+        if not samples:
+            logger.error("local eSpeak returned no audio samples")
+            return None
+
+        ensure_file_path_exists(voice_file)
+        output_path = voice_file
+        temporary_wav = None
+        if Path(voice_file).suffix.lower() != ".wav":
+            temporary_wav = f"{voice_file}.espeak.wav"
+            output_path = temporary_wav
+        with wave.open(output_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(samples)
+
+        if temporary_wav:
+            command = [
+                utils.get_ffmpeg_binary(), "-nostdin", "-v", "error", "-y",
+                "-i", temporary_wav, voice_file,
+            ]
+            try:
+                subprocess.run(command, capture_output=True, text=True, check=True)
+            finally:
+                Path(temporary_wav).unlink(missing_ok=True)
+
+        duration = (len(samples) / 2) / float(sample_rate)
+        if duration <= 0 or not Path(voice_file).is_file() or Path(voice_file).stat().st_size <= 0:
+            return None
+        sub_maker = ensure_legacy_submaker_fields(SubMaker())
+        logger.success(f"local eSpeak NG tts succeeded: {voice_file}")
+        return populate_legacy_submaker_with_full_text(sub_maker, clean_text, duration)
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+        logger.error(f"local eSpeak NG tts failed: {exc}")
+        return None
 
 
 def tts(
