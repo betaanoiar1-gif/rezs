@@ -144,8 +144,9 @@ class ShortsReviewService {
       privacyStatus: input.privacyStatus,
       containsSyntheticMedia,
       contentType: 'short',
+      canonicalWorkflow: 'phase3f_short',
       approvedArtifact: frozenArtifact,
-      finalApprovalEvidence: { approvedAt: evidence.approvedAt, artifact: approvedArtifact }
+      finalApprovalEvidence: { passed: true, approvedAt: evidence.approvedAt, artifact: approvedArtifact }
     });
     if (!schedule) throw new ShortsReviewError('Approved Short could not be scheduled', 'SCHEDULING_FAILED');
     await this.database.updateProductionStatus(productionJobId, 'scheduled');

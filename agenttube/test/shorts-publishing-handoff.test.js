@@ -50,12 +50,28 @@ class MemoryDb {
   async getShortsProductionPreparation(id) { return id === 'prep-1' ? this.chain.preparation : null; }
   async getShortsPlanningJob(id) { return id === 'plan-1' ? this.chain.planning : null; }
   async getProductionBundle(id) { return id === 'prod-1' ? this.bundle : null; }
-  async updateProductionStatus(_id, status) { this.bundle.status = status; this.statuses.push(status); }
+  async getLatestScheduleEntry(id) { return id === 'prod-1' ? this.bundle.schedule : null; }
+  async updateProductionStatus(_id, status) { if (this.bundle) this.bundle.status = status; this.statuses.push(status); }
   async updateScheduleEntry(entry) { this.bundle.schedule = entry; }
 }
 
 function publisher(db) {
-  return { calls: 0, async scheduleContent(input) { this.calls++; const entry = { id: 'schedule-1', productionId: input.id, publishTime: input.scheduledPublishTime, status: 'scheduled', metadata: { seo: input.seo, video: input.assets.finalVideo, audio: input.assets.audio, embeddedAudioValidation: input.assets.embeddedAudioValidation, approvedArtifact: input.approvedArtifact, privacyStatus: input.privacyStatus, containsSyntheticMedia: input.containsSyntheticMedia, contentType: input.contentType, finalApprovalEvidence: input.finalApprovalEvidence } }; db.bundle.schedule = entry; return entry; } };
+  return { calls: 0, async scheduleContent(input) { this.calls++; const entry = { id: 'schedule-1', productionId: input.id, publishTime: input.scheduledPublishTime, status: 'scheduled', metadata: { seo: input.seo, video: input.assets.finalVideo, audio: input.assets.audio, embeddedAudioValidation: input.assets.embeddedAudioValidation, approvedArtifact: input.approvedArtifact, privacyStatus: input.privacyStatus, containsSyntheticMedia: input.containsSyntheticMedia, contentType: input.contentType, canonicalWorkflow: input.canonicalWorkflow, finalApprovalEvidence: input.finalApprovalEvidence } }; db.bundle.schedule = entry; return entry; } };
+}
+
+function persistedCanonicalEntry(db) {
+  const approval = db.bundle.editorData.finalApprovalGate;
+  return {
+    id: 'schedule-1', productionId: 'prod-1', status: 'scheduled', publishTime: new Date().toISOString(),
+    metadata: {
+      contentType: 'short', canonicalWorkflow: 'phase3f_short', shortClipId: null,
+      seo: db.bundle.seo, video: db.bundle.assets.finalVideo, audio: null,
+      embeddedAudioValidation: db.bundle.assets.embeddedAudioValidation,
+      approvedArtifact: { path: artifact, sha256, fileSize: bytes.length },
+      finalApprovalEvidence: { passed: true, approvedAt: approval.approvedAt, artifact: approval.artifact },
+      containsSyntheticMedia: true, privacyStatus: 'private'
+    }
+  };
 }
 
 async function expectCode(promise, code) { await assert.rejects(promise, error => error instanceof ShortsReviewError && error.code === code); }
@@ -129,20 +145,62 @@ test('publishing accepts strict Shorts embedded audio while preserving legacy au
 test('publishing blocks changed artifacts before upload and synchronizes safe status', async () => {
   const db = new MemoryDb(); const updates = []; db.updateScheduleEntry = async entry => updates.push({ ...entry });
   const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0;
-  const entry = { id: 's', productionId: 'prod-1', status: 'scheduled', publishTime: new Date().toISOString(), metadata: { contentType: 'short', video: db.bundle.assets.finalVideo, audio: null, embeddedAudioValidation: db.bundle.assets.embeddedAudioValidation, approvedArtifact: { path: artifact, sha256, fileSize: bytes.length } } };
+  const entry = persistedCanonicalEntry(db);
   agent.publishQueue = [entry]; agent.uploadToYouTube = async () => { uploads++; return { id: 'youtube' }; };
   await fs.writeFile(artifact, Buffer.alloc(bytes.length, 8));
   await assert.rejects(agent.publishContent('prod-1'), error => error.code === 'ARTIFACT_INTEGRITY_FAILED');
   assert.equal(uploads, 0); assert.equal(updates.at(-1).status, 'failed'); assert.equal(db.bundle.status, 'needs_attention');
 });
 
-test('queue rechecks approval and provenance before upload', async () => {
-  for (const [field, value, code] of [['review_status', 'rejected', 'APPROVAL_BLOCKED'], ['provenance', { status: 'operator_reviewed' }, 'PROVENANCE_BLOCKED']]) {
-    const db = new MemoryDb(); if (field === 'provenance') db.bundle.provenance = value; else db.bundle[field] = value;
-    db.updateScheduleEntry = async () => {}; const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0;
-    agent.publishQueue = [{ id: 's', productionId: 'prod-1', status: 'scheduled', metadata: { contentType: 'short' } }]; agent.uploadToYouTube = async () => { uploads++; };
-    await assert.rejects(agent.publishContent('prod-1'), error => error.code === code); assert.equal(uploads, 0);
-  }
+test('persisted canonical Short fails closed when its production bundle is missing after restart', async () => {
+  const db = new MemoryDb(); const entry = persistedCanonicalEntry(db); db.bundle = null; db.getLatestScheduleEntry = async () => entry;
+  const updates = []; db.updateScheduleEntry = async value => updates.push({ ...value });
+  const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0; agent.uploadToYouTube = async () => { uploads++; };
+  await assert.rejects(agent.publishContent('prod-1'), error => error.code === 'PRODUCTION_BUNDLE_REQUIRED');
+  assert.equal(uploads, 0); assert.equal(entry.uploadAttempted, undefined); assert.notEqual(entry.status, 'published');
+  assert.equal(updates.at(-1).status, 'failed'); assert.deepEqual(db.statuses, ['needs_attention']);
+});
+
+test('persisted canonical Short fails closed when production bundle lookup rejects', async () => {
+  const db = new MemoryDb(); const entry = persistedCanonicalEntry(db); db.bundle.schedule = entry;
+  db.getProductionBundle = async () => { throw new Error('database unavailable'); };
+  const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0; agent.uploadToYouTube = async () => { uploads++; };
+  await assert.rejects(agent.publishContent('prod-1'), error => error.code === 'PRODUCTION_BUNDLE_UNAVAILABLE');
+  assert.equal(uploads, 0); assert.equal(entry.uploadAttempted, undefined); assert.equal(entry.status, 'failed');
+  assert.deepEqual(db.statuses, ['needs_attention']);
+});
+
+test('queue rechecks Phase 3F approval evidence and provenance before upload', async t => {
+  const cases = [
+    ['review is not approved', db => { db.bundle.review_status = 'rejected'; }, 'APPROVAL_BLOCKED'],
+    ['approval evidence is missing', db => { db.bundle.editorData.finalApprovalGate = null; }, 'APPROVAL_BLOCKED'],
+    ['persisted approval evidence is invalid', (_db, entry) => { entry.metadata.finalApprovalEvidence.artifact.sha256 = 'a'.repeat(64); }, 'APPROVAL_BLOCKED'],
+    ['provenance is ineligible', db => { db.bundle.provenance = { status: 'operator_reviewed' }; }, 'PROVENANCE_BLOCKED']
+  ];
+  for (const [name, mutate, code] of cases) await t.test(name, async () => {
+    const db = new MemoryDb(); const entry = persistedCanonicalEntry(db); db.bundle.schedule = entry; mutate(db, entry);
+    const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0; agent.uploadToYouTube = async () => { uploads++; };
+    await assert.rejects(agent.publishContent('prod-1'), error => error.code === code);
+    assert.equal(uploads, 0); assert.equal(entry.uploadAttempted, undefined); assert.equal(entry.status, 'failed');
+  });
+});
+
+test('valid persisted canonical Short still follows the successful mocked publishing path', async () => {
+  const db = new MemoryDb(); const entry = persistedCanonicalEntry(db); db.bundle.schedule = entry;
+  const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0;
+  agent.uploadToYouTube = async value => { uploads++; assert.equal(value.uploadAttempted, undefined); return { id: 'youtube-id' }; };
+  const result = await agent.publishContent('prod-1');
+  assert.equal(uploads, 1); assert.equal(result.status, 'published'); assert.equal(result.youtubeId, 'youtube-id');
+});
+
+test('legacy non-Short publishing remains independent of canonical Phase 3F bundles', async () => {
+  const audio = path.join(directory, 'legacy.mp3'); await fs.writeFile(audio, 'audio');
+  const db = new MemoryDb(); db.bundle = null; db.updateScheduleEntry = async () => {};
+  const entry = { id: 'legacy', productionId: 'legacy-prod', status: 'scheduled', publishTime: new Date().toISOString(), metadata: { contentType: 'long_form', video: { path: artifact }, audio: { path: audio } } };
+  db.getLatestScheduleEntry = async () => entry; const agent = new PublishingSchedulingAgent(db, {}); let uploads = 0;
+  agent.uploadToYouTube = async () => { uploads++; return { id: 'legacy-youtube-id' }; };
+  const result = await agent.publishContent('legacy-prod');
+  assert.equal(uploads, 1); assert.equal(result.status, 'published');
 });
 
 test('synthetic-media state reaches mocked YouTube metadata and lifecycle statuses remain accurate', async () => {

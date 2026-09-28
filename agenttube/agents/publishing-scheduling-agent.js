@@ -88,6 +88,7 @@ class PublishingSchedulingAgent {
           contentType: productionData.contentType || 'long_form',
           sourceProductionId: productionData.sourceProductionId || productionData.id,
           shortClipId: productionData.shortClipId || null,
+          canonicalWorkflow: productionData.canonicalWorkflow || null,
           embeddedAudioValidation: productionData.assets?.embeddedAudioValidation || null,
           approvedArtifact: productionData.approvedArtifact || null,
           finalApprovalEvidence: productionData.finalApprovalEvidence || null
@@ -122,31 +123,47 @@ class PublishingSchedulingAgent {
           throw error;
         }
       }
-      if (this.db.getProductionBundle) productionBundle = await this.db.getProductionBundle(contentId);
       this.logger.info(`Publishing content: ${contentId}`);
-      
+
       let scheduleEntry = this.publishQueue.find(entry =>
         entry.productionId === contentId || entry.id === contentId
       );
       if (!scheduleEntry && this.db.getLatestScheduleEntry) {
         scheduleEntry = await this.db.getLatestScheduleEntry(contentId);
       }
-      
+
       if (!scheduleEntry) {
         throw new Error(`Content not found in queue: ${contentId}`);
       }
       if (scheduleEntry.status === 'published') return scheduleEntry;
-      if (productionBundle && productionBundle.review_status !== 'approved') {
-        await this.blockScheduledPublish(scheduleEntry, 'Phase 3F approval is no longer valid');
-        const error = new Error('Publishing is blocked because approval is no longer valid');
+
+      const canonicalShort = this.isCanonicalPhase3FShort(scheduleEntry);
+      try {
+        if (this.db.getProductionBundle) productionBundle = await this.db.getProductionBundle(scheduleEntry.productionId);
+      } catch (_error) {
+        if (canonicalShort) {
+          await this.blockScheduledPublish(scheduleEntry, 'Canonical production bundle could not be loaded');
+          const error = new Error('Publishing is blocked because the canonical production bundle could not be loaded');
+          error.status = 409; error.code = 'PRODUCTION_BUNDLE_UNAVAILABLE'; throw error;
+        }
+        throw _error;
+      }
+      if (canonicalShort && !productionBundle) {
+        await this.blockScheduledPublish(scheduleEntry, 'Canonical production bundle is missing');
+        const error = new Error('Publishing is blocked because the canonical production bundle is missing');
+        error.status = 409; error.code = 'PRODUCTION_BUNDLE_REQUIRED'; throw error;
+      }
+      if (canonicalShort && !this.hasValidPhase3FApproval(scheduleEntry, productionBundle)) {
+        await this.blockScheduledPublish(scheduleEntry, 'Phase 3F approval evidence is missing or invalid');
+        const error = new Error('Publishing is blocked because Phase 3F approval evidence is missing or invalid');
         error.status = 409; error.code = 'APPROVAL_BLOCKED'; throw error;
       }
-      if (productionBundle && !['verified', 'not_required'].includes(productionBundle.provenance?.status)) {
+      if (canonicalShort && !['verified', 'not_required'].includes(productionBundle.provenance?.status)) {
         await this.blockScheduledPublish(scheduleEntry, 'Publishing provenance is no longer eligible');
         const error = new Error('Publishing is blocked until every factual claim is supported or explicitly waived');
         error.status = 409; error.code = 'PROVENANCE_BLOCKED'; throw error;
       }
-      if (scheduleEntry.metadata?.contentType === 'short' && !scheduleEntry.metadata?.shortClipId) {
+      if (canonicalShort) {
         try { await this.validateScheduledArtifact(scheduleEntry); } catch (_error) {
           await this.blockScheduledPublish(scheduleEntry, 'Approved artifact identity changed before upload');
           const error = new Error('Publishing is blocked because the approved artifact identity changed');
@@ -304,6 +321,32 @@ class PublishingSchedulingAgent {
     } catch (_error) {
       return false;
     }
+  }
+
+  isCanonicalPhase3FShort(scheduleEntry) {
+    const metadata = scheduleEntry?.metadata || {};
+    if (metadata.canonicalWorkflow === 'phase3f_short') return true;
+    // Backward compatibility for Phase 4 schedules persisted before the explicit marker existed.
+    return metadata.contentType === 'short' && !metadata.shortClipId && Boolean(metadata.approvedArtifact);
+  }
+
+  hasValidPhase3FApproval(scheduleEntry, productionBundle) {
+    const metadata = scheduleEntry.metadata || {};
+    const frozen = metadata.finalApprovalEvidence;
+    const canonical = productionBundle?.editorData?.finalApprovalGate;
+    const confirmations = productionBundle?.editorData?.confirmations || {};
+    const required = ['factualContentReviewed', 'rightsConfirmed', 'metadataReviewed', 'privacyReviewed', 'syntheticMediaReviewed'];
+    const determination = productionBundle?.editorData?.syntheticMediaDetermination;
+    return productionBundle?.review_status === 'approved' && canonical?.passed === true &&
+      required.every(field => confirmations[field] === true) &&
+      ['contains_synthetic_media', 'does_not_contain_synthetic_media'].includes(determination) &&
+      Boolean(frozen?.approvedAt) && frozen.approvedAt === canonical.approvedAt &&
+      frozen.artifact?.path === metadata.approvedArtifact?.path &&
+      frozen.artifact?.sha256 === metadata.approvedArtifact?.sha256 &&
+      Number(frozen.artifact?.fileSize) === Number(metadata.approvedArtifact?.fileSize) &&
+      canonical.artifact?.path === metadata.approvedArtifact?.path &&
+      canonical.artifact?.sha256 === metadata.approvedArtifact?.sha256 &&
+      Number(canonical.artifact?.fileSize) === Number(metadata.approvedArtifact?.fileSize);
   }
 
   async validateScheduledArtifact(scheduleEntry) {
