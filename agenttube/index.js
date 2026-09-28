@@ -30,6 +30,7 @@ const { DiscoverabilityService } = require('./utils/discoverability-service');
 const { ShortsPlanningService, PlanningError } = require('./services/shorts-planning-service');
 const { ShortsProductionPreparationService, ProductionPreparationError } = require('./services/shorts-production-preparation-service');
 const { ShortsProductionExecutionService, ShortsProductionExecutionError } = require('./services/shorts-production-execution-service');
+const { ShortsReviewService, ShortsReviewError } = require('./services/shorts-review-service');
 const { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService } = require('./integrations/moneyprinterturbo');
 const { version } = require('./package.json');
 const chalk = require('chalk');
@@ -228,6 +229,21 @@ class YouTubeAutomationAgent {
 
       return next();
     };
+  }
+
+  sendShortsReviewError(res, error) {
+    const status = ['PRODUCTION_NOT_FOUND', 'ARTIFACT_NOT_FOUND', 'REVIEW_NOT_FOUND'].includes(error.code) ? 404
+      : ['PRODUCTION_NOT_READY', 'ARTIFACT_INVALID', 'PROVENANCE_INCOMPLETE', 'REVIEW_LOCKED'].includes(error.code) ? 409
+        : 400;
+    const expected = error instanceof ShortsReviewError;
+    return res.status(expected ? status : 500).json({
+      success: false,
+      error: {
+        code: expected ? error.code : 'SHORTS_REVIEW_FAILED',
+        message: expected ? error.message : 'Shorts review operation failed',
+        details: expected ? error.details : null
+      }
+    });
   }
 
   validateGenerateRequestBody(body = {}) {
@@ -549,6 +565,36 @@ class YouTubeAutomationAgent {
       const provenance = await service.getProvenance(req.params.productionJobId);
       if (!provenance) return res.status(404).json({ success: false, error: { code: 'PRODUCTION_NOT_FOUND', message: 'Production job not found' } });
       return res.json({ success: true, job: provenance.production, provenance });
+    });
+
+    this.app.post('/api/production/shorts/:productionJobId/review', protect, async (req, res) => {
+      try {
+        const service = new ShortsReviewService({ database: this.db, operator: this.operator });
+        const review = await service.handoff(req.params.productionJobId);
+        return res.status(200).json({ success: true, review });
+      } catch (error) {
+        return this.sendShortsReviewError(res, error);
+      }
+    });
+
+    this.app.get('/api/production/shorts/:productionJobId/review', async (req, res) => {
+      try {
+        const service = new ShortsReviewService({ database: this.db, operator: this.operator });
+        const review = await service.get(req.params.productionJobId);
+        return res.json({ success: true, review });
+      } catch (error) {
+        return this.sendShortsReviewError(res, error);
+      }
+    });
+
+    this.app.post('/api/production/shorts/:productionJobId/review/:action', protect, async (req, res) => {
+      try {
+        const service = new ShortsReviewService({ database: this.db, operator: this.operator });
+        const review = await service.decide(req.params.productionJobId, req.params.action, req.body || {});
+        return res.json({ success: true, review });
+      } catch (error) {
+        return this.sendShortsReviewError(res, error);
+      }
     });
 
     this.app.get('/api/dashboard', async (_req, res) => {

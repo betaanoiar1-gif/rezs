@@ -71,13 +71,20 @@ class OperatorService {
       }
       sceneAudioReady = readiness.every(Boolean);
     }
-    const narrationReady = intentionalSilence || productionAudioReady || sceneAudioReady;
+    const embeddedAudio = production.assets?.embeddedAudioValidation;
+    const embeddedAudioReady = production.contentType === 'short' &&
+      embeddedAudio?.passed === true && Boolean(embeddedAudio.audioCodec) &&
+      Number(embeddedAudio.durationSeconds) > 0 && finalVideo?.validation?.passed === true &&
+      embeddedAudio.sourceArtifactPath === finalVideo.path && await this.fileExists(finalVideo.path);
+    const narrationReady = intentionalSilence || productionAudioReady || sceneAudioReady || embeddedAudioReady;
     checks.push(this.check('narration', narrationReady,
       intentionalSilence
         ? `Intentional silence confirmed: ${audio.silenceReason}`
-        : narrationReady
-          ? `Narration is ready${audio.provider ? ` via ${audio.provider}` : ''}`
-          : audio.intentionalSilence
+        : embeddedAudioReady
+          ? `Embedded narration audio was validated in the final MP4 (${embeddedAudio.audioCodec})`
+          : narrationReady
+            ? `Narration is ready${audio.provider ? ` via ${audio.provider}` : ''}`
+            : audio.intentionalSilence
             ? 'Intentional silence requires an operator confirmation and reason of at least 10 characters'
             : 'Narration is missing or unusable; regenerate it before approval'));
 
