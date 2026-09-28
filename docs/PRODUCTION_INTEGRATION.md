@@ -75,3 +75,20 @@ npm test
 ```
 
 The deterministic adapter suite uses injected HTTP and persistence doubles; it does not call paid services, YouTube, or a live MPT instance.
+
+## Verified local end-to-end run
+
+On 2026-09-28 the adapter was also validated against a real local MPT 1.3.7 process started with:
+
+```bash
+cd moneyprinterturbo
+.venv/bin/python main.py
+```
+
+`GET /ping` returned HTTP 200 and `"pong"`. AgentTube submitted `POST /api/v1/videos` with a caller-supplied script, one 15-second local MP4 material, subtitles and background music disabled, and `voice_name: "local_espeak:en"`. No cloud provider or credential was used. The observed lifecycle was `SUBMITTED → RUNNING → SUCCEEDED → ARTIFACT_DOWNLOADED` for AgentTube job `phase2d_1790617420692` and MPT task `b25a8742-d8b0-499e-8e5e-8fa9e1b33e45`.
+
+The task's returned `/tasks/{task_id}/final-1.mp4` path corresponds to the existing MPT download endpoint `GET /api/v1/download/{task_id}/final-1.mp4`; that explicit endpoint was passed to `download_artifact()`. The downloaded file was stored at `agenttube/data/mpt-artifacts/phase2d_1790617420692/final.mp4` (runtime data, not committed).
+
+MPT's bundled FFmpeg 7.0.2 decoded the complete artifact while explicitly mapping both streams to a null sink. Validation found a 5,188,713-byte, 12.47-second MP4 containing H.264 High 1080×1920 video and AAC-LC 44.1 kHz stereo audio. SHA-256 was `5fd407c4cfe2d5e72f2c52968a2031370cb8833b19ac8f6529dcd7c0f8135134`. The exact submitted script matched both MPT task state and its persisted `script.json`. A second status lookup left one durable SQLite row unchanged, with `SUCCEEDED`, no error, retry count zero, timestamps, and the downloaded artifact path.
+
+This is a production-adapter integration check, not a Shorts quality gate or autonomous content workflow.
