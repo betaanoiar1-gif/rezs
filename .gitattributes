@@ -1,0 +1,4 @@
+# Preserve vendored upstream source byte-for-byte while excluding its existing
+# trailing whitespace from integration-repository patch checks.
+agenttube/** whitespace=-trailing-space
+moneyprinterturbo/** whitespace=-trailing-space
