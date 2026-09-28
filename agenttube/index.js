@@ -28,6 +28,7 @@ const { GrowthExperimentService } = require('./utils/growth-experiment-service')
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
 const { ShortsPlanningService, PlanningError } = require('./services/shorts-planning-service');
+const { ShortsProductionPreparationService, ProductionPreparationError } = require('./services/shorts-production-preparation-service');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -497,6 +498,28 @@ class YouTubeAutomationAgent {
       const job = await this.db.getShortsPlanningJob(req.params.jobId);
       if (!job) return res.status(404).json({ success: false, error: { code: 'PLANNING_JOB_NOT_FOUND', message: 'Planning job not found' } });
       return res.json({ success: true, job });
+    });
+
+    this.app.post('/api/planning/shorts/:jobId/prepare-production', protect, async (req, res) => {
+      try {
+        const service = new ShortsProductionPreparationService({ database: this.db });
+        const preparation = await service.prepare(req.params.jobId);
+        return res.status(200).json({ success: true, preparation });
+      } catch (error) {
+        const status = error.code === 'PLANNING_JOB_NOT_FOUND' ? 404
+          : error.code === 'INVALID_PLANNING_JOB_ID' ? 400
+            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED'].includes(error.code) ? 422 : 500;
+        return res.status(status).json({
+          success: false,
+          error: { code: error.code || 'PRODUCTION_PREPARATION_FAILED', message: error.message, details: error instanceof ProductionPreparationError ? error.details : null }
+        });
+      }
+    });
+
+    this.app.get('/api/production-preparations/shorts/:preparationId', async (req, res) => {
+      const preparation = await this.db.getShortsProductionPreparation(req.params.preparationId);
+      if (!preparation) return res.status(404).json({ success: false, error: { code: 'PRODUCTION_PREPARATION_NOT_FOUND', message: 'Production preparation not found' } });
+      return res.json({ success: true, preparation });
     });
 
     this.app.get('/api/dashboard', async (_req, res) => {

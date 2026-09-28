@@ -147,6 +147,20 @@ class Database {
       `CREATE INDEX IF NOT EXISTS idx_shorts_planning_jobs_status_updated
        ON shorts_planning_jobs(status, updated_at)`,
 
+      // Deterministic Phase 3B quality-gate results; rendering remains in production_jobs
+      `CREATE TABLE IF NOT EXISTS shorts_production_preparations (
+        preparation_id TEXT PRIMARY KEY,
+        planning_job_id TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        quality_result_json TEXT,
+        specification_json TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (planning_job_id) REFERENCES shorts_planning_jobs(job_id)
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_shorts_production_preparations_status_updated
+       ON shorts_production_preparations(status, updated_at)`,
+
       // Publishing Schedule
       `CREATE TABLE IF NOT EXISTS publish_schedule (
         id TEXT PRIMARY KEY,
@@ -874,6 +888,54 @@ class Database {
         changes.error_message === undefined ? current.error_message : changes.error_message, jobId]
     );
     return this.getShortsPlanningJob(jobId);
+  }
+
+  // Phase 3B Shorts production-preparation methods
+  async createShortsProductionPreparation(preparation = {}) {
+    const validStatuses = new Set(['VALIDATING', 'PRODUCTION_READY', 'REJECTED']);
+    if (!preparation.preparation_id || !preparation.planning_job_id || !validStatuses.has(preparation.status)) {
+      throw new Error('Invalid Shorts production preparation');
+    }
+    await this.executeQuery(
+      `INSERT OR IGNORE INTO shorts_production_preparations
+       (preparation_id, planning_job_id, status) VALUES (?, ?, ?)`,
+      [preparation.preparation_id, preparation.planning_job_id, preparation.status]
+    );
+    return this.getShortsProductionPreparation(preparation.preparation_id);
+  }
+
+  async getShortsProductionPreparation(preparationId) {
+    const row = await this.getRow('SELECT * FROM shorts_production_preparations WHERE preparation_id = ?', [preparationId]);
+    if (!row) return null;
+    return {
+      ...row,
+      quality_result: row.quality_result_json ? JSON.parse(row.quality_result_json) : null,
+      specification: row.specification_json ? JSON.parse(row.specification_json) : null,
+      quality_result_json: undefined,
+      specification_json: undefined
+    };
+  }
+
+  async getShortsProductionPreparationByPlanningJob(planningJobId) {
+    const row = await this.getRow('SELECT preparation_id FROM shorts_production_preparations WHERE planning_job_id = ?', [planningJobId]);
+    return row ? this.getShortsProductionPreparation(row.preparation_id) : null;
+  }
+
+  async updateShortsProductionPreparation(preparationId, changes = {}) {
+    const current = await this.getShortsProductionPreparation(preparationId);
+    if (!current) return null;
+    const validStatuses = new Set(['VALIDATING', 'PRODUCTION_READY', 'REJECTED']);
+    const status = changes.status ?? current.status;
+    if (!validStatuses.has(status)) throw new Error('Invalid Shorts production preparation status');
+    await this.executeQuery(
+      `UPDATE shorts_production_preparations SET status = ?, quality_result_json = ?,
+       specification_json = ?, updated_at = CURRENT_TIMESTAMP WHERE preparation_id = ?`,
+      [status,
+        changes.quality_result === undefined ? (current.quality_result ? JSON.stringify(current.quality_result) : null) : JSON.stringify(changes.quality_result),
+        changes.specification === undefined ? (current.specification ? JSON.stringify(current.specification) : null) : changes.specification === null ? null : JSON.stringify(changes.specification),
+        preparationId]
+    );
+    return this.getShortsProductionPreparation(preparationId);
   }
 
   // Production methods
