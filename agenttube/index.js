@@ -235,7 +235,10 @@ class YouTubeAutomationAgent {
     const status = ['PRODUCTION_NOT_FOUND', 'ARTIFACT_NOT_FOUND', 'REVIEW_NOT_FOUND'].includes(error.code) ? 404
       : ['PRODUCTION_NOT_READY', 'ARTIFACT_INVALID', 'PROVENANCE_INCOMPLETE', 'REVIEW_LOCKED',
           'ARTIFACT_VALIDATION_EVIDENCE_INVALID', 'ARTIFACT_INTEGRITY_FAILED',
-          'FINAL_ARTIFACT_VALIDATION_FAILED', 'FINAL_QUALITY_GATE_FAILED'].includes(error.code) ? 409
+          'FINAL_ARTIFACT_VALIDATION_FAILED', 'FINAL_QUALITY_GATE_FAILED', 'FINAL_APPROVAL_REQUIRED',
+          'FINAL_APPROVAL_EVIDENCE_INVALID', 'PROVENANCE_NOT_PUBLISHABLE', 'PROVENANCE_INCONSISTENT',
+          'APPROVED_ARTIFACT_INVALID', 'PRODUCTION_NOT_READY_FOR_SCHEDULING', 'SYNTHETIC_MEDIA_INCONSISTENT',
+          'SCHEDULE_CONFLICT', 'SCHEDULING_FAILED'].includes(error.code) ? 409
         : 400;
     const expected = error instanceof ShortsReviewError;
     return res.status(expected ? status : 500).json({
@@ -594,6 +597,16 @@ class YouTubeAutomationAgent {
         const service = new ShortsReviewService({ database: this.db, operator: this.operator });
         const review = await service.decide(req.params.productionJobId, req.params.action, req.body || {});
         return res.json({ success: true, review });
+      } catch (error) {
+        return this.sendShortsReviewError(res, error);
+      }
+    });
+
+    this.app.post('/api/production/shorts/:productionJobId/schedule', protect, async (req, res) => {
+      try {
+        const service = new ShortsReviewService({ database: this.db, operator: this.operator });
+        const schedule = await service.schedule(req.params.productionJobId, req.body || {}, this.agents.publishing);
+        return res.status(200).json({ success: true, schedule });
       } catch (error) {
         return this.sendShortsReviewError(res, error);
       }

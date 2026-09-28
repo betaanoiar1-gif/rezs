@@ -4,6 +4,7 @@ const fsSync = require('fs');
 const path = require('path');
 const { Logger } = require('../utils/logger');
 const { assertValidYouTubeMetadata } = require('../utils/youtube-metadata-validator');
+const { hashFileSha256 } = require('../services/shorts-production-execution-service');
 
 class PublishingSchedulingAgent {
   constructor(db, credentials) {
@@ -49,7 +50,12 @@ class PublishingSchedulingAgent {
         this.logger.warn(`Not scheduling ${productionData.id}: no real video file was produced (placeholder/simulated output). Fix your AI provider keys and FFmpeg, then regenerate.`);
         return null;
       }
-      if (!await this.isNarrationReady(productionData.assets?.audio)) {
+      if (!await this.isNarrationReady(productionData.assets?.audio, {
+        contentType: productionData.contentType,
+        video: finalVideo,
+        embeddedAudioValidation: productionData.assets?.embeddedAudioValidation,
+        approvedArtifact: productionData.approvedArtifact
+      })) {
         this.logger.warn(`Not scheduling ${productionData.id}: narration is missing. Regenerate narration or explicitly confirm an intentional silent video.`);
         return null;
       }
@@ -81,7 +87,10 @@ class PublishingSchedulingAgent {
           containsSyntheticMedia: productionData.containsSyntheticMedia === true,
           contentType: productionData.contentType || 'long_form',
           sourceProductionId: productionData.sourceProductionId || productionData.id,
-          shortClipId: productionData.shortClipId || null
+          shortClipId: productionData.shortClipId || null,
+          embeddedAudioValidation: productionData.assets?.embeddedAudioValidation || null,
+          approvedArtifact: productionData.approvedArtifact || null,
+          finalApprovalEvidence: productionData.finalApprovalEvidence || null
         },
         createdAt: new Date().toISOString()
       };
@@ -113,15 +122,7 @@ class PublishingSchedulingAgent {
           throw error;
         }
       }
-      if (this.db.getProductionBundle) {
-        productionBundle = await this.db.getProductionBundle(contentId);
-        if (productionBundle && !['verified', 'not_required'].includes(productionBundle.provenance?.status || 'not_required')) {
-          const error = new Error('Publishing is blocked until every factual claim is supported or explicitly waived');
-          error.status = 409;
-          error.code = 'PROVENANCE_BLOCKED';
-          throw error;
-        }
-      }
+      if (this.db.getProductionBundle) productionBundle = await this.db.getProductionBundle(contentId);
       this.logger.info(`Publishing content: ${contentId}`);
       
       let scheduleEntry = this.publishQueue.find(entry =>
@@ -135,7 +136,29 @@ class PublishingSchedulingAgent {
         throw new Error(`Content not found in queue: ${contentId}`);
       }
       if (scheduleEntry.status === 'published') return scheduleEntry;
-      if (!await this.isNarrationReady(scheduleEntry.metadata?.audio || productionBundle?.assets?.audio)) {
+      if (productionBundle && productionBundle.review_status !== 'approved') {
+        await this.blockScheduledPublish(scheduleEntry, 'Phase 3F approval is no longer valid');
+        const error = new Error('Publishing is blocked because approval is no longer valid');
+        error.status = 409; error.code = 'APPROVAL_BLOCKED'; throw error;
+      }
+      if (productionBundle && !['verified', 'not_required'].includes(productionBundle.provenance?.status)) {
+        await this.blockScheduledPublish(scheduleEntry, 'Publishing provenance is no longer eligible');
+        const error = new Error('Publishing is blocked until every factual claim is supported or explicitly waived');
+        error.status = 409; error.code = 'PROVENANCE_BLOCKED'; throw error;
+      }
+      if (scheduleEntry.metadata?.contentType === 'short' && !scheduleEntry.metadata?.shortClipId) {
+        try { await this.validateScheduledArtifact(scheduleEntry); } catch (_error) {
+          await this.blockScheduledPublish(scheduleEntry, 'Approved artifact identity changed before upload');
+          const error = new Error('Publishing is blocked because the approved artifact identity changed');
+          error.status = 409; error.code = 'ARTIFACT_INTEGRITY_FAILED'; throw error;
+        }
+      }
+      if (!await this.isNarrationReady(scheduleEntry.metadata?.audio || productionBundle?.assets?.audio, {
+        contentType: scheduleEntry.metadata?.contentType,
+        video: scheduleEntry.metadata?.video,
+        embeddedAudioValidation: scheduleEntry.metadata?.embeddedAudioValidation,
+        approvedArtifact: scheduleEntry.metadata?.approvedArtifact
+      })) {
         const error = new Error('Publishing is blocked because narration is missing or the intentional-silence override is incomplete');
         error.status = 409;
         error.code = 'NARRATION_REQUIRED';
@@ -243,6 +266,7 @@ class PublishingSchedulingAgent {
     scheduleEntry.youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
     scheduleEntry.error = null;
     await this.db.updateScheduleEntry(scheduleEntry);
+    await this.syncShortStatus(scheduleEntry, 'uploaded');
     
     // Upload thumbnail
     if (metadata.thumbnail && metadata.thumbnail.path) {
@@ -257,17 +281,47 @@ class PublishingSchedulingAgent {
     return videoUpload.data;
   }
 
-  async isNarrationReady(audio = {}) {
-    if (audio.intentionalSilence === true) {
+  async isNarrationReady(audio = {}, context = {}) {
+    if (audio?.intentionalSilence === true) {
       return String(audio.silenceReason || '').trim().length >= 10 && Boolean(audio.silenceConfirmedAt);
     }
-    if (!audio.path || audio.simulated || String(audio.path).endsWith('.info')) return false;
+    if (audio?.path && !audio.simulated && !String(audio.path).endsWith('.info')) {
+      try {
+        const stats = await fs.stat(audio.path);
+        if (stats.isFile() && stats.size > 0) return true;
+      } catch (_error) { /* continue to the Shorts embedded-audio path */ }
+    }
+    if (context.contentType !== 'short') return false;
+    const embedded = context.embeddedAudioValidation;
+    const video = context.video;
+    const approved = context.approvedArtifact;
+    if (embedded?.passed !== true || !embedded.audioCodec || !(Number(embedded.durationSeconds) > 0) ||
+        embedded.sourceArtifactPath !== video?.path || video?.validation?.passed !== true ||
+        approved?.path !== video?.path || !/^[a-f0-9]{64}$/i.test(String(approved?.sha256)) || !(Number(approved?.fileSize) > 0)) return false;
     try {
-      const stats = await fs.stat(audio.path);
-      return stats.isFile() && stats.size > 0;
+      const stats = await fs.stat(video.path);
+      return stats.isFile() && stats.size === Number(approved.fileSize) && stats.size > 0;
     } catch (_error) {
       return false;
     }
+  }
+
+  async validateScheduledArtifact(scheduleEntry) {
+    const video = scheduleEntry.metadata?.video;
+    const approved = scheduleEntry.metadata?.approvedArtifact;
+    if (!video?.path || approved?.path !== video.path || path.extname(video.path).toLowerCase() !== '.mp4' ||
+        !/^[a-f0-9]{64}$/i.test(String(approved?.sha256)) || !(Number(approved?.fileSize) > 0)) throw new Error('Approved artifact evidence is invalid');
+    const stats = await fs.stat(video.path);
+    if (!stats.isFile() || stats.size !== Number(approved.fileSize) || stats.size < 1) throw new Error('Approved artifact size changed');
+    if (await hashFileSha256(video.path) !== approved.sha256) throw new Error('Approved artifact bytes changed');
+    return true;
+  }
+
+  async blockScheduledPublish(scheduleEntry, message) {
+    scheduleEntry.status = 'failed';
+    scheduleEntry.error = message;
+    await this.db.updateScheduleEntry(scheduleEntry);
+    if (this.db.updateProductionStatus) await this.db.updateProductionStatus(scheduleEntry.productionId, 'needs_attention');
   }
 
   isUploadOutcomeUnknown(error) {
@@ -300,14 +354,19 @@ class PublishingSchedulingAgent {
 
   async syncShortStatus(scheduleEntry, status, error = null) {
     const clipId = scheduleEntry.metadata?.shortClipId;
-    if (!clipId || !this.db.updateShortClip) return null;
-    return this.db.updateShortClip(clipId, {
-      status,
-      scheduleId: scheduleEntry.id,
-      youtubeId: scheduleEntry.youtubeId || null,
-      youtubeUrl: scheduleEntry.youtubeUrl || null,
-      error
-    });
+    if (clipId && this.db.updateShortClip) {
+      return this.db.updateShortClip(clipId, {
+        status,
+        scheduleId: scheduleEntry.id,
+        youtubeId: scheduleEntry.youtubeId || null,
+        youtubeUrl: scheduleEntry.youtubeUrl || null,
+        error
+      });
+    }
+    if (scheduleEntry.metadata?.contentType === 'short' && this.db.updateProductionStatus) {
+      await this.db.updateProductionStatus(scheduleEntry.productionId, status);
+    }
+    return null;
   }
 
   async getVideoStream(videoPath) {

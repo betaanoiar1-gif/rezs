@@ -62,6 +62,96 @@ class ShortsReviewService {
     return this.reviewResponse(bundle, chain);
   }
 
+  async schedule(productionJobId, input = {}, publishing) {
+    if (input.confirmed !== true) throw new ShortsReviewError('Explicit scheduling confirmation is required', 'SCHEDULING_CONFIRMATION_REQUIRED');
+    if (typeof input.publishTime !== 'string' || !input.publishTime.trim()) throw new ShortsReviewError('An explicit future publish time is required', 'INVALID_PUBLISH_TIME');
+    const publishTime = new Date(input.publishTime);
+    if (!Number.isFinite(publishTime.getTime()) || publishTime.getTime() <= Date.now()) throw new ShortsReviewError('Choose a valid future publish time', 'INVALID_PUBLISH_TIME');
+    if (!['private', 'unlisted', 'public'].includes(input.privacyStatus)) throw new ShortsReviewError('An explicit supported privacy status is required', 'INVALID_PRIVACY_STATE');
+    if (!publishing?.scheduleContent) throw new ShortsReviewError('Publishing is not configured', 'PUBLISHING_UNAVAILABLE');
+
+    const chain = await this.requireCompletedChain(productionJobId);
+    const bundle = await this.database.getProductionBundle(productionJobId);
+    if (!bundle || bundle.review_status !== 'approved') throw new ShortsReviewError('Phase 3F approval is required before scheduling', 'FINAL_APPROVAL_REQUIRED');
+    const evidence = bundle.editorData?.finalApprovalGate;
+    const confirmations = bundle.editorData?.confirmations || {};
+    const requiredConfirmations = ['factualContentReviewed', 'rightsConfirmed', 'metadataReviewed', 'privacyReviewed', 'syntheticMediaReviewed'];
+    const determination = bundle.editorData?.syntheticMediaDetermination;
+    if (evidence?.passed !== true || requiredConfirmations.some(field => confirmations[field] !== true) ||
+        !['contains_synthetic_media', 'does_not_contain_synthetic_media'].includes(determination)) {
+      throw new ShortsReviewError('Structurally valid Phase 3F approval evidence is required', 'FINAL_APPROVAL_EVIDENCE_INVALID');
+    }
+
+    if (!['verified', 'not_required'].includes(bundle.provenance?.status)) {
+      throw new ShortsReviewError('Publishing requires verified or not-required provenance', 'PROVENANCE_NOT_PUBLISHABLE');
+    }
+    if (bundle.provenance.status === 'verified' && (!Array.isArray(bundle.provenance.sources) || !bundle.provenance.sources.length ||
+        !sameValue(bundle.provenance.sources, chain.planning.artifact.research?.sources || []))) {
+      throw new ShortsReviewError('Verified provenance no longer matches the approved source evidence', 'PROVENANCE_INCONSISTENT');
+    }
+
+    const finalVideo = bundle.assets?.finalVideo;
+    const embeddedAudio = bundle.assets?.embeddedAudioValidation;
+    const approvedArtifact = evidence.artifact || {};
+    const phase3 = chain.production.validation_result || {};
+    const approvedPath = approvedArtifact.path;
+    if (!finalVideo?.path || finalVideo.path !== chain.production.artifact_path || approvedPath !== finalVideo.path ||
+        embeddedAudio?.sourceArtifactPath !== finalVideo.path || embeddedAudio.passed !== true ||
+        !embeddedAudio.audioCodec || !(Number(embeddedAudio.durationSeconds) > 0) || finalVideo.validation?.passed !== true) {
+      throw new ShortsReviewError('Approved video and embedded-audio evidence are inconsistent', 'APPROVED_ARTIFACT_INVALID');
+    }
+    if (approvedArtifact.sha256 !== phase3.sha256 || Number(approvedArtifact.fileSize) !== Number(phase3.file_size) ||
+        approvedArtifact.technicalValidation?.sha256 !== phase3.sha256) {
+      throw new ShortsReviewError('Phase 3C and Phase 3F artifact evidence do not match', 'APPROVED_ARTIFACT_INVALID');
+    }
+    let stat;
+    try { stat = await fs.lstat(finalVideo.path); } catch { throw new ShortsReviewError('Approved artifact was not found', 'ARTIFACT_NOT_FOUND'); }
+    if (!stat.isFile() || stat.size < 1 || !finalVideo.path.toLowerCase().endsWith('.mp4')) {
+      throw new ShortsReviewError('Approved artifact must be a non-empty regular MP4', 'APPROVED_ARTIFACT_INVALID');
+    }
+    const sha256 = await this.artifactHasher(finalVideo.path);
+    if (sha256 !== phase3.sha256 || stat.size !== Number(phase3.file_size)) {
+      throw new ShortsReviewError('Approved artifact identity changed before scheduling', 'ARTIFACT_INTEGRITY_FAILED');
+    }
+
+    const normalizedTime = publishTime.toISOString();
+    const frozenArtifact = { path: finalVideo.path, sha256, fileSize: stat.size };
+    const existing = bundle.schedule;
+    if (existing) {
+      const existingTime = existing.publish_time || existing.publishTime;
+      const existingPrivacy = existing.metadata?.privacyStatus;
+      const existingArtifact = existing.metadata?.approvedArtifact;
+      if (existingTime === normalizedTime && existingPrivacy === input.privacyStatus && sameValue(existingArtifact, frozenArtifact)) {
+        if (bundle.status === 'approved') await this.database.updateProductionStatus(productionJobId, 'scheduled');
+        return existing;
+      }
+      throw new ShortsReviewError('A different schedule already exists; use the reschedule workflow', 'SCHEDULE_CONFLICT');
+    }
+    if (bundle.status !== 'approved') throw new ShortsReviewError('Approved production is not ready for initial scheduling', 'PRODUCTION_NOT_READY_FOR_SCHEDULING');
+
+    const containsSyntheticMedia = determination === 'contains_synthetic_media';
+    if (bundle.provenance.containsSyntheticMedia !== containsSyntheticMedia || bundle.editorData.containsSyntheticMedia !== containsSyntheticMedia) {
+      throw new ShortsReviewError('Synthetic-media determination is inconsistent', 'SYNTHETIC_MEDIA_INCONSISTENT');
+    }
+    const numericCategory = /^\d{1,3}$/.test(String(bundle.seo?.category || '')) ? String(bundle.seo.category) : null;
+    const schedule = await publishing.scheduleContent({
+      id: productionJobId,
+      script: bundle.script,
+      seo: { ...bundle.seo, ...(numericCategory ? { categoryId: numericCategory } : {}) },
+      assets: bundle.assets,
+      scheduledPublishTime: normalizedTime,
+      priority: bundle.priority,
+      privacyStatus: input.privacyStatus,
+      containsSyntheticMedia,
+      contentType: 'short',
+      approvedArtifact: frozenArtifact,
+      finalApprovalEvidence: { approvedAt: evidence.approvedAt, artifact: approvedArtifact }
+    });
+    if (!schedule) throw new ShortsReviewError('Approved Short could not be scheduled', 'SCHEDULING_FAILED');
+    await this.database.updateProductionStatus(productionJobId, 'scheduled');
+    return schedule;
+  }
+
   async decide(productionJobId, action, input = {}) {
     if (!DECISIONS.has(action)) throw new ShortsReviewError('Review action must be approve, reject, or request-changes', 'INVALID_REVIEW_ACTION');
     const chain = await this.requireCompletedChain(productionJobId);
@@ -202,6 +292,7 @@ class ShortsReviewService {
       passed: true,
       approvedAt,
       artifact: {
+        path: chain.production.artifact_path,
         sha256: observedSha256,
         fileSize: chain.artifactStat.size,
         technicalValidation
