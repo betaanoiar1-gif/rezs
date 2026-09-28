@@ -9,6 +9,14 @@ const GEMINI_MODELS = [
 const GEMINI_DEFAULT_MODEL = GEMINI_MODELS[0];
 
 const PROVIDERS = {
+  cleanapis: {
+    name: 'Clean APIs',
+    baseURL: 'https://www.cleanapis.com/v1',
+    defaultModel: null,
+    models: [],
+    envKey: 'CLEANAPIS_API_KEY',
+    modelEnvKey: 'CLEANAPIS_MODEL',
+  },
   openai: {
     name: 'OpenAI',
     baseURL: 'https://api.openai.com/v1',
@@ -69,7 +77,8 @@ class AITextService {
     for (const [, preset] of Object.entries(PROVIDERS)) {
       const key = process.env[preset.envKey];
       if (key) {
-        return this._initOpenAICompatible(preset, key);
+        const environmentModel = preset.modelEnvKey ? process.env[preset.modelEnvKey] : null;
+        return this._initOpenAICompatible(preset, key, environmentModel);
       }
     }
 
@@ -102,6 +111,9 @@ class AITextService {
 
   async generateText(prompt, options = {}) {
     const model = options.model || this.model;
+    if (!model) {
+      throw new Error(`${this.providerName || 'AI provider'} requires an explicitly selected model`);
+    }
     const maxTokens = options.maxTokens || 2048;
     const temperature = options.temperature ?? 0.7;
 
