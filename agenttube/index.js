@@ -27,6 +27,7 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { ShortsPlanningService, PlanningError } = require('./services/shorts-planning-service');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -471,6 +472,32 @@ class YouTubeAutomationAgent {
 
   setupOperatorAPI() {
     const protect = this.requireAPIKey();
+
+    this.app.post('/api/planning/shorts', protect, async (req, res) => {
+      try {
+        const service = new ShortsPlanningService({
+          database: this.db,
+          credentials: this.credentials,
+          strategyAgent: this.agents.strategy,
+          scriptAgent: this.agents.scriptWriter,
+          seoAgent: this.agents.seoOptimizer
+        });
+        const job = await service.planTopic(req.body?.topic);
+        return res.status(201).json({ success: true, job });
+      } catch (error) {
+        const status = error.code === 'INVALID_TOPIC' ? 400 : error.code === 'AI_PROVIDER_UNAVAILABLE' ? 503 : 502;
+        return res.status(status).json({
+          success: false,
+          error: { code: error.code || 'PLANNING_FAILED', message: error.message, details: error instanceof PlanningError ? error.details : null }
+        });
+      }
+    });
+
+    this.app.get('/api/planning/shorts/:jobId', async (req, res) => {
+      const job = await this.db.getShortsPlanningJob(req.params.jobId);
+      if (!job) return res.status(404).json({ success: false, error: { code: 'PLANNING_JOB_NOT_FOUND', message: 'Planning job not found' } });
+      return res.json({ success: true, job });
+    });
 
     this.app.get('/api/dashboard', async (_req, res) => {
       try {

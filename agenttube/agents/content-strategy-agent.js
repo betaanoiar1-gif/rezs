@@ -264,6 +264,7 @@ class ContentStrategyAgent {
         estimatedViews: this.predictViews(topic),
         bestPublishTime: this.calculateBestPublishTime(),
         competitorAnalysis: this.getCompetitorInsights(topic),
+        metadata: { generationSource: 'template' },
         createdAt: new Date().toISOString()
       };
 
@@ -472,6 +473,7 @@ Avoid fabricated claims and unsupported numbers.`;
         estimatedViews: this.predictViews(topic),
         bestPublishTime: this.calculateBestPublishTime(),
         competitorAnalysis: this.getCompetitorInsights(topic),
+        metadata: { generationSource: 'ai' },
         createdAt: new Date().toISOString()
       };
     } catch (error) {

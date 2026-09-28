@@ -73,7 +73,8 @@ class SEOOptimizerAgent {
           secondaryKeywords: strategy.keywords.slice(1, 5),
           targetLength: this.calculateOptimalLength(strategy.contentType),
           language: 'en',
-          category: this.selectCategory(strategy)
+          category: this.selectCategory(strategy),
+          generationSource: aiSEO ? 'ai' : 'template'
         },
         createdAt: new Date().toISOString()
       };

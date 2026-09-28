@@ -130,6 +130,23 @@ class Database {
       `CREATE INDEX IF NOT EXISTS idx_production_jobs_status_updated
        ON production_jobs(status, updated_at)`,
 
+      // Topic-to-Shorts planning jobs are intentionally separate from rendering jobs
+      `CREATE TABLE IF NOT EXISTS shorts_planning_jobs (
+        job_id TEXT PRIMARY KEY,
+        topic TEXT NOT NULL,
+        status TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        provider TEXT,
+        model TEXT,
+        artifact_json TEXT,
+        error_code TEXT,
+        error_message TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_shorts_planning_jobs_status_updated
+       ON shorts_planning_jobs(status, updated_at)`,
+
       // Publishing Schedule
       `CREATE TABLE IF NOT EXISTS publish_schedule (
         id TEXT PRIMARY KEY,
@@ -822,6 +839,41 @@ class Database {
       ]
     );
     return id;
+  }
+
+  // Topic-to-Shorts planning methods
+  async createShortsPlanningJob(job = {}) {
+    const validStatuses = new Set(['PENDING', 'RUNNING', 'SUCCEEDED', 'BLOCKED', 'FAILED']);
+    if (!job.job_id || !job.topic || !validStatuses.has(job.status)) throw new Error('Invalid Shorts planning job');
+    await this.executeQuery(
+      `INSERT INTO shorts_planning_jobs (job_id, topic, status, stage, provider, model)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [job.job_id, job.topic, job.status, job.stage || job.status, job.provider || null, job.model || null]
+    );
+    return this.getShortsPlanningJob(job.job_id);
+  }
+
+  async getShortsPlanningJob(jobId) {
+    const row = await this.getRow('SELECT * FROM shorts_planning_jobs WHERE job_id = ?', [jobId]);
+    if (!row) return null;
+    return { ...row, artifact: row.artifact_json ? JSON.parse(row.artifact_json) : null, artifact_json: undefined };
+  }
+
+  async updateShortsPlanningJob(jobId, changes = {}) {
+    const current = await this.getShortsPlanningJob(jobId);
+    if (!current) return null;
+    const validStatuses = new Set(['PENDING', 'RUNNING', 'SUCCEEDED', 'BLOCKED', 'FAILED']);
+    const status = changes.status ?? current.status;
+    if (!validStatuses.has(status)) throw new Error('Invalid Shorts planning job status');
+    await this.executeQuery(
+      `UPDATE shorts_planning_jobs SET status = ?, stage = ?, provider = ?, model = ?, artifact_json = ?,
+       error_code = ?, error_message = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?`,
+      [status, changes.stage ?? current.stage, changes.provider ?? current.provider, changes.model ?? current.model,
+        changes.artifact === undefined ? (current.artifact ? JSON.stringify(current.artifact) : null) : JSON.stringify(changes.artifact),
+        changes.error_code === undefined ? current.error_code : changes.error_code,
+        changes.error_message === undefined ? current.error_message : changes.error_message, jobId]
+    );
+    return this.getShortsPlanningJob(jobId);
   }
 
   // Production methods
