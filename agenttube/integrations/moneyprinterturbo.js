@@ -1,0 +1,259 @@
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const crypto = require('crypto');
+const { Logger } = require('../utils/logger');
+
+const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
+const VALID_STATUSES = new Set(['SUBMITTED', 'RUNNING', ...TERMINAL]);
+
+class MptError extends Error {
+  constructor(message, { code = 'MPT_ERROR', status = null, transient = false, cause = null } = {}) {
+    super(message, { cause });
+    this.name = 'MptError';
+    this.code = code;
+    this.status = status;
+    this.transient = transient;
+  }
+}
+
+class MoneyPrinterTurboClient {
+  constructor(options = {}) {
+    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
+    this.connectTimeoutMs = positive(options.connectTimeoutMs ?? process.env.MPT_CONNECT_TIMEOUT_MS, 5000);
+    this.readTimeoutMs = positive(options.readTimeoutMs ?? process.env.MPT_READ_TIMEOUT_MS, 30000);
+    this.maxRetries = nonnegative(options.maxRetries ?? process.env.MPT_MAX_RETRIES, 2);
+    this.retryDelayMs = nonnegative(options.retryDelayMs ?? process.env.MPT_RETRY_DELAY_MS, 250);
+    this.artifactDir = path.resolve(options.artifactDir || process.env.MPT_ARTIFACT_DIR || path.join(__dirname, '..', 'data', 'mpt-artifacts'));
+    this.apiKey = options.apiKey || process.env.MPT_API_KEY || '';
+    this.fetch = options.fetch || globalThis.fetch;
+    this.logger = options.logger || new Logger('MoneyPrinterTurbo');
+    if (typeof this.fetch !== 'function') throw new MptError('A fetch implementation is required', { code: 'CONFIG_ERROR' });
+  }
+
+  async health() {
+    const response = await this._request('/ping');
+    return response === 'pong' || response === '"pong"' || response?.data === 'pong';
+  }
+
+  async create_video(specification) {
+    if (!specification || typeof specification !== 'object' || Array.isArray(specification)) {
+      throw new MptError('Video specification must be an object', { code: 'INVALID_REQUEST' });
+    }
+    const response = await this._request('/api/v1/videos', { method: 'POST', body: specification });
+    const taskId = response?.data?.task_id;
+    if (!taskId) throw new MptError('MPT response did not contain a task_id', { code: 'INVALID_RESPONSE' });
+    return { task_id: taskId, native: response };
+  }
+
+  async get_task_status(taskId) {
+    requireTaskId(taskId);
+    const response = await this._request(`/api/v1/tasks/${encodeURIComponent(taskId)}`);
+    const task = response?.data;
+    if (!task || typeof task.state !== 'number') throw new MptError('MPT returned an invalid task response', { code: 'INVALID_RESPONSE' });
+    return { ...task, lifecycle_status: mapMptState(task) };
+  }
+
+  async cancel_task(taskId) {
+    requireTaskId(taskId);
+    await this._request(`/api/v1/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+    return { task_id: taskId, status: 'CANCELLED' };
+  }
+
+  async download_artifact(artifactReference, destination) {
+    if (typeof artifactReference !== 'string' || !artifactReference.trim()) {
+      throw new MptError('Artifact reference is required', { code: 'INVALID_ARTIFACT' });
+    }
+    const target = await this._secureDestination(destination);
+    const url = this._artifactUrl(artifactReference);
+    const response = await this._request(url, { raw: true });
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    const temporary = `${target}.${crypto.randomUUID()}.part`;
+    try {
+      const bytes = Buffer.from(await this._withReadTimeout(response.arrayBuffer(), 'MPT artifact read timed out'));
+      if (!bytes.length) throw new MptError('Downloaded artifact is empty', { code: 'EMPTY_ARTIFACT' });
+      await fsp.writeFile(temporary, bytes, { flag: 'wx' });
+      await fsp.rename(temporary, target);
+      const stat = await fsp.stat(target);
+      if (!stat.isFile() || stat.size < 1) throw new MptError('Downloaded artifact is invalid', { code: 'EMPTY_ARTIFACT' });
+      return { path: target, size: stat.size };
+    } finally {
+      await fsp.rm(temporary, { force: true }).catch(() => {});
+    }
+  }
+
+  async _secureDestination(destination) {
+    if (typeof destination !== 'string' || !destination.trim() || path.isAbsolute(destination)) {
+      throw new MptError('Artifact destination must be a relative path', { code: 'UNSAFE_ARTIFACT_PATH' });
+    }
+    const root = this.artifactDir;
+    const target = path.resolve(root, destination);
+    if (target === root || !target.startsWith(`${root}${path.sep}`)) {
+      throw new MptError('Artifact destination escapes the configured directory', { code: 'UNSAFE_ARTIFACT_PATH' });
+    }
+    await fsp.mkdir(root, { recursive: true });
+    const rootReal = await fsp.realpath(root);
+    let cursor = path.dirname(target);
+    while (cursor.startsWith(root) && cursor !== path.dirname(root)) {
+      try {
+        const stat = await fsp.lstat(cursor);
+        if (stat.isSymbolicLink()) throw new MptError('Symlinked artifact destination is forbidden', { code: 'UNSAFE_ARTIFACT_PATH' });
+        const real = await fsp.realpath(cursor);
+        if (real !== rootReal && !real.startsWith(`${rootReal}${path.sep}`)) throw new MptError('Unsafe artifact destination', { code: 'UNSAFE_ARTIFACT_PATH' });
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      if (cursor === root) break;
+      cursor = path.dirname(cursor);
+    }
+    try {
+      if ((await fsp.lstat(target)).isSymbolicLink()) throw new MptError('Symlinked artifact destination is forbidden', { code: 'UNSAFE_ARTIFACT_PATH' });
+      throw new MptError('Artifact destination already exists', { code: 'ARTIFACT_EXISTS' });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    return target;
+  }
+
+  _artifactUrl(reference) {
+    if (/^https?:\/\//i.test(reference)) {
+      const remote = new URL(reference);
+      const base = new URL(this.baseUrl);
+      if (remote.origin !== base.origin) throw new MptError('Cross-origin artifact URL is forbidden', { code: 'UNSAFE_ARTIFACT_URL' });
+      return remote.toString();
+    }
+    const normalized = reference.startsWith('/') ? reference : `/${reference}`;
+    return normalized.startsWith('/tasks/') ? `/api/v1/download${normalized}` : normalized;
+  }
+
+  async _request(resource, options = {}) {
+    const url = /^https?:\/\//i.test(resource) ? resource : `${this.baseUrl}${resource}`;
+    let lastError;
+    for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
+      try {
+        const response = await this._fetchOnce(url, options);
+        if (!response.ok) {
+          const transient = response.status === 408 || response.status === 429 || response.status >= 500;
+          throw new MptError(`MPT request failed with HTTP ${response.status}`, { code: 'HTTP_ERROR', status: response.status, transient });
+        }
+        if (options.raw) return response;
+        const text = await this._readText(response);
+        try { return JSON.parse(text); } catch { return text; }
+      } catch (error) {
+        lastError = normalizeError(error);
+        if (!lastError.transient || attempt === this.maxRetries) throw lastError;
+        this.logger.warn(`Transient MPT request failure; retry ${attempt + 1}/${this.maxRetries}`);
+        if (this.retryDelayMs) await sleep(this.retryDelayMs * (attempt + 1));
+      }
+    }
+    throw lastError;
+  }
+
+  async _fetchOnce(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.connectTimeoutMs);
+    const headers = { Accept: 'application/json' };
+    if (this.apiKey) headers['x-api-key'] = this.apiKey;
+    if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+    try {
+      return await this.fetch(url, {
+        method: options.method || 'GET', headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body), signal: controller.signal
+      });
+    } catch (error) {
+      const timedOut = error?.name === 'AbortError';
+      throw new MptError(timedOut ? 'MPT connection timed out' : 'MPT network request failed', {
+        code: timedOut ? 'CONNECT_TIMEOUT' : 'NETWORK_ERROR', transient: true, cause: error
+      });
+    } finally { clearTimeout(timer); }
+  }
+
+  async _readText(response) {
+    return this._withReadTimeout(response.text(), 'MPT response read timed out');
+  }
+
+  async _withReadTimeout(promise, message) {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new MptError(message, { code: 'READ_TIMEOUT', transient: true })), this.readTimeoutMs);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+class MoneyPrinterTurboProductionService {
+  constructor({ client, database, pollIntervalMs = 2000, maxPolls = 300, logger } = {}) {
+    this.client = client;
+    this.database = database;
+    this.pollIntervalMs = nonnegative(pollIntervalMs, 2000);
+    this.maxPolls = positive(maxPolls, 300);
+    this.logger = logger || new Logger('MPTProduction');
+  }
+
+  async submit(jobId, specification) {
+    await this.database.createProductionJob({ job_id: jobId, status: 'SUBMITTED', stage: 'SUBMITTING' });
+    try {
+      const result = await this.client.create_video(specification);
+      return this.database.updateProductionJob(jobId, { mpt_task_id: result.task_id, status: 'RUNNING', stage: 'RENDERING', last_error: null });
+    } catch (error) {
+      await this.database.updateProductionJob(jobId, { status: 'FAILED', stage: 'SUBMISSION_FAILED', last_error: normalizeError(error).message });
+      throw error;
+    }
+  }
+
+  async poll(jobId) {
+    let job = await this.database.getProductionJob(jobId);
+    if (!job?.mpt_task_id) throw new MptError('Production job has no MPT task ID', { code: 'INVALID_JOB' });
+    for (let count = 0; count < this.maxPolls; count += 1) {
+      const task = await this.client.get_task_status(job.mpt_task_id);
+      const status = task.lifecycle_status;
+      if (status === 'SUCCEEDED') {
+        return this.database.updateProductionJob(jobId, { status, stage: 'RENDERED', last_error: null });
+      }
+      if (status === 'FAILED' || status === 'CANCELLED') {
+        return this.database.updateProductionJob(jobId, { status, stage: status, last_error: task.error || task.failed_stage || null });
+      }
+      await this.database.updateProductionJob(jobId, { status: 'RUNNING', stage: 'RENDERING' });
+      if (count + 1 < this.maxPolls && this.pollIntervalMs) await sleep(this.pollIntervalMs);
+    }
+    return this.database.updateProductionJob(jobId, { status: 'TIMEOUT', stage: 'POLL_TIMEOUT', last_error: 'MPT polling limit reached' });
+  }
+
+  async downloadArtifact(jobId, artifactReference, filename = 'final.mp4') {
+    const job = await this.database.getProductionJob(jobId);
+    if (!job || job.status !== 'SUCCEEDED') throw new MptError('Only successful production jobs can download artifacts', { code: 'INVALID_JOB' });
+    const relativePath = path.join(jobId, filename);
+    const artifact = await this.client.download_artifact(artifactReference, relativePath);
+    return this.database.updateProductionJob(jobId, { stage: 'ARTIFACT_DOWNLOADED', artifact_path: artifact.path, last_error: null });
+  }
+
+  async cancel(jobId) {
+    const job = await this.database.getProductionJob(jobId);
+    if (!job?.mpt_task_id) throw new MptError('Production job has no MPT task ID', { code: 'INVALID_JOB' });
+    await this.client.cancel_task(job.mpt_task_id);
+    return this.database.updateProductionJob(jobId, { status: 'CANCELLED', stage: 'CANCELLED', last_error: null });
+  }
+}
+
+function mapMptState(task) {
+  if (task.state === 1) return 'SUCCEEDED';
+  if (task.state === -1) return 'FAILED';
+  if (task.state === 4 || task.state === 0) return 'RUNNING';
+  return task.cancelled ? 'CANCELLED' : 'RUNNING';
+}
+function requireTaskId(value) { if (typeof value !== 'string' || !value.trim()) throw new MptError('task_id is required', { code: 'INVALID_TASK_ID' }); }
+function positive(value, fallback) { const number = Number(value); return Number.isFinite(number) && number > 0 ? number : fallback; }
+function nonnegative(value, fallback) { const number = Number(value); return Number.isFinite(number) && number >= 0 ? number : fallback; }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function normalizeError(error) {
+  if (error instanceof MptError) return error;
+  return new MptError(error?.message || 'Unknown MPT error', { code: 'NETWORK_ERROR', transient: true, cause: error });
+}
+
+module.exports = { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService, MptError, VALID_STATUSES, TERMINAL, mapMptState };

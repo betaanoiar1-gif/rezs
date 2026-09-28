@@ -115,6 +115,21 @@ class Database {
         FOREIGN KEY (seo_id) REFERENCES seo_data(id)
       )`,
       
+      // Durable MoneyPrinterTurbo production jobs
+      `CREATE TABLE IF NOT EXISTS production_jobs (
+        job_id TEXT PRIMARY KEY,
+        mpt_task_id TEXT UNIQUE,
+        status TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        artifact_path TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_production_jobs_status_updated
+       ON production_jobs(status, updated_at)`,
+
       // Publishing Schedule
       `CREATE TABLE IF NOT EXISTS publish_schedule (
         id TEXT PRIMARY KEY,
@@ -810,6 +825,48 @@ class Database {
   }
 
   // Production methods
+  async createProductionJob(job = {}) {
+    const validStatuses = new Set(['SUBMITTED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
+    if (!job.job_id || !validStatuses.has(job.status)) throw new Error('Invalid production job');
+    await this.executeQuery(
+      `INSERT INTO production_jobs (
+        job_id, mpt_task_id, status, stage, retry_count, last_error, artifact_path
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [job.job_id, job.mpt_task_id || null, job.status, job.stage || job.status, job.retry_count || 0, job.last_error || null, job.artifact_path || null]
+    );
+    return this.getProductionJob(job.job_id);
+  }
+
+  async getProductionJob(jobId) {
+    return this.getRow('SELECT * FROM production_jobs WHERE job_id = ?', [jobId]);
+  }
+
+  async updateProductionJob(jobId, changes = {}) {
+    const current = await this.getProductionJob(jobId);
+    if (!current) return null;
+    const validStatuses = new Set(['SUBMITTED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
+    const status = changes.status ?? current.status;
+    if (!validStatuses.has(status)) throw new Error('Invalid production job status');
+    await this.executeQuery(
+      `UPDATE production_jobs SET mpt_task_id = ?, status = ?, stage = ?, retry_count = ?,
+       last_error = ?, artifact_path = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?`,
+      [
+        changes.mpt_task_id ?? current.mpt_task_id,
+        status,
+        changes.stage ?? current.stage,
+        changes.retry_count ?? current.retry_count,
+        changes.last_error === undefined ? current.last_error : changes.last_error,
+        changes.artifact_path === undefined ? current.artifact_path : changes.artifact_path,
+        jobId
+      ]
+    );
+    return this.getProductionJob(jobId);
+  }
+
+  async listProductionJobs(limit = 50) {
+    return this.getAllRows('SELECT * FROM production_jobs ORDER BY updated_at DESC LIMIT ?', [limit]);
+  }
+
   async saveProductionData(production) {
     await this.executeQuery(
       `INSERT OR REPLACE INTO productions (
