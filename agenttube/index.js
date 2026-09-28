@@ -29,6 +29,8 @@ const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
 const { ShortsPlanningService, PlanningError } = require('./services/shorts-planning-service');
 const { ShortsProductionPreparationService, ProductionPreparationError } = require('./services/shorts-production-preparation-service');
+const { ShortsProductionExecutionService, ShortsProductionExecutionError } = require('./services/shorts-production-execution-service');
+const { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService } = require('./integrations/moneyprinterturbo');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -520,6 +522,33 @@ class YouTubeAutomationAgent {
       const preparation = await this.db.getShortsProductionPreparation(req.params.preparationId);
       if (!preparation) return res.status(404).json({ success: false, error: { code: 'PRODUCTION_PREPARATION_NOT_FOUND', message: 'Production preparation not found' } });
       return res.json({ success: true, preparation });
+    });
+
+    this.app.post('/api/production/shorts/:preparationId/start', protect, async (req, res) => {
+      try {
+        const client = new MoneyPrinterTurboClient();
+        const productionService = new MoneyPrinterTurboProductionService({ client, database: this.db });
+        const service = new ShortsProductionExecutionService({ database: this.db, client, productionService });
+        const submitted = await service.start(req.params.preparationId);
+        const job = await service.execute(submitted.job_id);
+        return res.status(job.status === 'SUCCEEDED' ? 200 : 202).json({ success: true, job });
+      } catch (error) {
+        const status = error.code === 'PREPARATION_NOT_FOUND' ? 404
+          : error.code === 'PREPARATION_NOT_READY' ? 422
+            : error.code === 'PRODUCTION_ALREADY_EXISTS' ? 409
+              : 502;
+        return res.status(status).json({
+          success: false,
+          error: { code: error.code || 'PRODUCTION_EXECUTION_FAILED', message: error.message, details: error instanceof ShortsProductionExecutionError ? error.details : null }
+        });
+      }
+    });
+
+    this.app.get('/api/production/shorts/:productionJobId', async (req, res) => {
+      const service = new ShortsProductionExecutionService({ database: this.db });
+      const provenance = await service.getProvenance(req.params.productionJobId);
+      if (!provenance) return res.status(404).json({ success: false, error: { code: 'PRODUCTION_NOT_FOUND', message: 'Production job not found' } });
+      return res.json({ success: true, job: provenance.production, provenance });
     });
 
     this.app.get('/api/dashboard', async (_req, res) => {

@@ -118,14 +118,19 @@ class Database {
       // Durable MoneyPrinterTurbo production jobs
       `CREATE TABLE IF NOT EXISTS production_jobs (
         job_id TEXT PRIMARY KEY,
+        preparation_id TEXT UNIQUE,
+        planning_job_id TEXT,
         mpt_task_id TEXT UNIQUE,
         status TEXT NOT NULL,
         stage TEXT NOT NULL,
         retry_count INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
+        artifact_reference TEXT,
         artifact_path TEXT,
+        validation_result_json TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT
       )`,
       `CREATE INDEX IF NOT EXISTS idx_production_jobs_status_updated
        ON production_jobs(status, updated_at)`,
@@ -675,6 +680,15 @@ class Database {
       await this.executeQuery(tableQuery);
     }
 
+    await this.ensureColumns('production_jobs', {
+      preparation_id: 'TEXT',
+      planning_job_id: 'TEXT',
+      artifact_reference: 'TEXT',
+      validation_result_json: 'TEXT',
+      completed_at: 'TEXT'
+    });
+    await this.executeQuery(`CREATE UNIQUE INDEX IF NOT EXISTS idx_production_jobs_preparation
+      ON production_jobs(preparation_id) WHERE preparation_id IS NOT NULL`);
     await this.ensureColumns('production_scenes', {
       narration_provider: 'TEXT',
       narration_model: 'TEXT',
@@ -699,7 +713,7 @@ class Database {
   }
 
   async ensureColumns(tableName, columns) {
-    const allowedTables = new Set(['production_scenes', 'channel_strategies', 'discoverability_audits']);
+    const allowedTables = new Set(['production_jobs', 'production_scenes', 'channel_strategies', 'discoverability_audits']);
     if (!allowedTables.has(tableName)) throw new Error(`Unsupported migration table: ${tableName}`);
     const existing = new Set((await this.getAllRows(`PRAGMA table_info(${tableName})`)).map(column => column.name));
     for (const [columnName, definition] of Object.entries(columns)) {
@@ -940,39 +954,50 @@ class Database {
 
   // Production methods
   async createProductionJob(job = {}) {
-    const validStatuses = new Set(['SUBMITTED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
+    const validStatuses = new Set(['QUEUED', 'SUBMITTED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
     if (!job.job_id || !validStatuses.has(job.status)) throw new Error('Invalid production job');
     await this.executeQuery(
       `INSERT INTO production_jobs (
-        job_id, mpt_task_id, status, stage, retry_count, last_error, artifact_path
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [job.job_id, job.mpt_task_id || null, job.status, job.stage || job.status, job.retry_count || 0, job.last_error || null, job.artifact_path || null]
+        job_id, preparation_id, planning_job_id, mpt_task_id, status, stage, retry_count,
+        last_error, artifact_reference, artifact_path, validation_result_json, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [job.job_id, job.preparation_id || null, job.planning_job_id || null, job.mpt_task_id || null,
+        job.status, job.stage || job.status, job.retry_count || 0, job.last_error || null,
+        job.artifact_reference || null, job.artifact_path || null,
+        job.validation_result ? JSON.stringify(job.validation_result) : null, job.completed_at || null]
     );
     return this.getProductionJob(job.job_id);
   }
 
   async getProductionJob(jobId) {
-    return this.getRow('SELECT * FROM production_jobs WHERE job_id = ?', [jobId]);
+    const row = await this.getRow('SELECT * FROM production_jobs WHERE job_id = ?', [jobId]);
+    if (!row) return undefined;
+    return { ...row, validation_result: row.validation_result_json ? JSON.parse(row.validation_result_json) : null, validation_result_json: undefined };
+  }
+
+  async getProductionJobByPreparation(preparationId) {
+    const row = await this.getRow('SELECT job_id FROM production_jobs WHERE preparation_id = ?', [preparationId]);
+    return row ? this.getProductionJob(row.job_id) : null;
   }
 
   async updateProductionJob(jobId, changes = {}) {
     const current = await this.getProductionJob(jobId);
     if (!current) return null;
-    const validStatuses = new Set(['SUBMITTED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
+    const validStatuses = new Set(['QUEUED', 'SUBMITTED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
     const status = changes.status ?? current.status;
     if (!validStatuses.has(status)) throw new Error('Invalid production job status');
     await this.executeQuery(
-      `UPDATE production_jobs SET mpt_task_id = ?, status = ?, stage = ?, retry_count = ?,
-       last_error = ?, artifact_path = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?`,
-      [
-        changes.mpt_task_id ?? current.mpt_task_id,
-        status,
-        changes.stage ?? current.stage,
+      `UPDATE production_jobs SET preparation_id = ?, planning_job_id = ?, mpt_task_id = ?, status = ?, stage = ?, retry_count = ?,
+       last_error = ?, artifact_reference = ?, artifact_path = ?, validation_result_json = ?, completed_at = ?,
+       updated_at = CURRENT_TIMESTAMP WHERE job_id = ?`,
+      [changes.preparation_id ?? current.preparation_id, changes.planning_job_id ?? current.planning_job_id,
+        changes.mpt_task_id ?? current.mpt_task_id, status, changes.stage ?? current.stage,
         changes.retry_count ?? current.retry_count,
         changes.last_error === undefined ? current.last_error : changes.last_error,
+        changes.artifact_reference === undefined ? current.artifact_reference : changes.artifact_reference,
         changes.artifact_path === undefined ? current.artifact_path : changes.artifact_path,
-        jobId
-      ]
+        changes.validation_result === undefined ? (current.validation_result ? JSON.stringify(current.validation_result) : null) : JSON.stringify(changes.validation_result),
+        changes.completed_at === undefined ? current.completed_at : changes.completed_at, jobId]
     );
     return this.getProductionJob(jobId);
   }

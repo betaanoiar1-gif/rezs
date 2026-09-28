@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const { Logger } = require('../utils/logger');
 
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
-const VALID_STATUSES = new Set(['SUBMITTED', 'RUNNING', ...TERMINAL]);
+const VALID_STATUSES = new Set(['QUEUED', 'SUBMITTED', 'RUNNING', ...TERMINAL]);
 
 class MptError extends Error {
   constructor(message, { code = 'MPT_ERROR', status = null, transient = false, cause = null } = {}) {
@@ -197,7 +197,13 @@ class MoneyPrinterTurboProductionService {
   }
 
   async submit(jobId, specification) {
-    await this.database.createProductionJob({ job_id: jobId, status: 'SUBMITTED', stage: 'SUBMITTING' });
+    const existing = await this.database.getProductionJob(jobId);
+    if (existing) {
+      if (existing.mpt_task_id) return existing;
+      await this.database.updateProductionJob(jobId, { status: 'SUBMITTED', stage: 'SUBMITTING' });
+    } else {
+      await this.database.createProductionJob({ job_id: jobId, status: 'SUBMITTED', stage: 'SUBMITTING' });
+    }
     try {
       const result = await this.client.create_video(specification);
       return this.database.updateProductionJob(jobId, { mpt_task_id: result.task_id, status: 'RUNNING', stage: 'RENDERING', last_error: null });
