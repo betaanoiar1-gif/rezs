@@ -1619,6 +1619,21 @@ class Database {
     return this.getContentProvenance(productionId);
   }
 
+  async saveShortsFinalApproval(productionId, { provenance, review, sceneIds = [] } = {}) {
+    await this.executeQuery('BEGIN TRANSACTION');
+    try {
+      await this.saveContentProvenance(productionId, provenance);
+      for (const sceneId of sceneIds) await this.updateProductionScene(productionId, sceneId, { locked: true });
+      await this.saveContentReview(productionId, review);
+      await this.updateProductionStatus(productionId, 'approved');
+      await this.executeQuery('COMMIT');
+    } catch (error) {
+      await this.executeQuery('ROLLBACK');
+      throw error;
+    }
+    return this.getProductionBundle(productionId);
+  }
+
   async getContentProvenance(productionId) {
     const row = await this.getRow('SELECT * FROM content_provenance WHERE production_id = ?', [productionId]);
     return row ? {

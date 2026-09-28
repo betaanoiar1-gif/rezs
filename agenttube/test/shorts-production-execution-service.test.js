@@ -135,7 +135,38 @@ test('valid MP4 validation checks streams, codecs, orientation, duration and ful
   });
   assert.equal(result.passed, true);
   assert.equal(result.resolution, '1080x1920');
+  assert.match(result.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(result.file_size, Buffer.byteLength('nonempty deterministic fixture'));
   assert.equal(decoded, true);
+});
+
+test('strict MP4 validation rejects every unsupported final artifact condition', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'artifact-invalid-'));
+  const file = path.join(directory, 'video.mp4');
+  await fs.writeFile(file, Buffer.from('nonempty deterministic fixture'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const valid = { container: 'mov,mp4', duration: 70, video: { codec: 'h264', width: 1080, height: 1920 }, audio: { codec: 'aac' } };
+  const cases = [
+    ['container', { ...valid, container: 'matroska' }],
+    ['video stream', { ...valid, video: null }],
+    ['audio stream', { ...valid, audio: null }],
+    ['vertical', { ...valid, video: { codec: 'h264', width: 1920, height: 1080 } }],
+    ['resolution', { ...valid, video: { codec: 'h264', width: 360, height: 640 } }],
+    ['aspect ratio', { ...valid, video: { codec: 'h264', width: 800, height: 1280 } }],
+    ['video codec', { ...valid, video: { codec: 'mpeg2video', width: 1080, height: 1920 } }],
+    ['audio codec', { ...valid, audio: { codec: 'pcm_s16le' } }],
+    ['duration', { ...valid, duration: 80 }]
+  ];
+  for (const [name, probe] of cases) {
+    await assert.rejects(validateVideoArtifact(file, 70, { probe: async () => probe, decode: async () => {} }), error => {
+      assert.equal(error.validation.passed, false, name);
+      return true;
+    });
+  }
+  await assert.rejects(validateVideoArtifact(file, 70, {
+    probe: async () => valid,
+    decode: async () => { throw new Error('decode failed'); }
+  }), error => error.validation.failures.some(failure => failure.includes('fully decodable')));
 });
 
 test('bounded polling timeout remains TIMEOUT', async () => {

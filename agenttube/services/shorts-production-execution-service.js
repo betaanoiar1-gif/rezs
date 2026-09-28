@@ -178,10 +178,17 @@ async function validateVideoArtifact(filePath, approvedDuration, options = {}) {
     catch (error) { failures.push(`Artifact is not fully decodable: ${error.message}`); }
   }
 
+  let sha256 = null;
+  if (!failures.length) {
+    try { sha256 = await hashFileSha256(filePath); }
+    catch (error) { failures.push(`Artifact hashing failed: ${error.message}`); }
+  }
+
   const result = {
     passed: failures.length === 0,
     failures,
     file_size: stat?.size || 0,
+    sha256,
     duration_seconds: probe?.duration || null,
     resolution: probe?.video ? `${probe.video.width}x${probe.video.height}` : null,
     video_codec: probe?.video?.codec || null,
@@ -232,6 +239,22 @@ async function decodeVideoArtifact(filePath) {
   await runFFmpeg(['-v', 'error', '-i', filePath, '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-']);
 }
 
+async function hashFileSha256(filePath) {
+  const hash = crypto.createHash('sha256');
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let bytesRead;
+    do {
+      ({ bytesRead } = await handle.read(buffer, 0, buffer.length, null));
+      if (bytesRead) hash.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead);
+    return hash.digest('hex');
+  } finally {
+    await handle.close();
+  }
+}
+
 function resolveArtifactReference(task, taskId) {
   const reference = Array.isArray(task?.videos) ? task.videos[0] : task?.video;
   if (typeof reference !== 'string' || !reference.trim()) throw new Error('MoneyPrinterTurbo did not return a final video artifact');
@@ -261,6 +284,7 @@ module.exports = {
   validateVideoArtifact,
   probeVideoArtifact,
   decodeVideoArtifact,
+  hashFileSha256,
   resolveArtifactReference,
   stableProductionJobId,
   sanitizeError

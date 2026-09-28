@@ -233,7 +233,9 @@ class YouTubeAutomationAgent {
 
   sendShortsReviewError(res, error) {
     const status = ['PRODUCTION_NOT_FOUND', 'ARTIFACT_NOT_FOUND', 'REVIEW_NOT_FOUND'].includes(error.code) ? 404
-      : ['PRODUCTION_NOT_READY', 'ARTIFACT_INVALID', 'PROVENANCE_INCOMPLETE', 'REVIEW_LOCKED'].includes(error.code) ? 409
+      : ['PRODUCTION_NOT_READY', 'ARTIFACT_INVALID', 'PROVENANCE_INCOMPLETE', 'REVIEW_LOCKED',
+          'ARTIFACT_VALIDATION_EVIDENCE_INVALID', 'ARTIFACT_INTEGRITY_FAILED',
+          'FINAL_ARTIFACT_VALIDATION_FAILED', 'FINAL_QUALITY_GATE_FAILED'].includes(error.code) ? 409
         : 400;
     const expected = error instanceof ShortsReviewError;
     return res.status(expected ? status : 500).json({

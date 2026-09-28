@@ -61,11 +61,14 @@ Approval requires all confirmation fields to be exactly `true`:
     "syntheticMediaReviewed": true
   },
   "privacyStatus": "private",
+  "syntheticMediaDetermination": "contains_synthetic_media",
   "notes": "Optional review note"
 }
 ```
 
-`privacyStatus` may be `private`, `unlisted`, or `public`, but this is only recorded review intent and never schedules or publishes anything.
+`privacyStatus` may be `private`, `unlisted`, or `public`, but this is only recorded review intent and never schedules or publishes anything. `syntheticMediaDetermination` is separately mandatory and must be either `contains_synthetic_media` or `does_not_contain_synthetic_media`; it records the actual human outcome rather than inferring one from the review checkbox.
+
+Before persisting approval, the service runs the final approval gate in the same operation. It revalidates the completed Phase 3 chain and immutable specification, compares the current artifact size and SHA-256 with Phase 3C evidence, reruns the existing strict MP4 validator, applies the candidate human provenance state, and reruns operator quality checks. Any remaining blocking technical or content check prevents approval. The approval transaction persists provenance, locked scenes, final quality evidence, human evidence, and approved production/review state together.
 
 Reject and request-changes require `reason` (or `notes`). Request changes maps to the existing canonical `needs_attention` state. Neither action mutates the approved script, scenes, artifact, or production provenance.
 
@@ -87,7 +90,9 @@ When Phase 3A performed no research, Phase 3E records `researchStatus: not_perfo
 
 ## Embedded MP4 audio
 
-Topic-generated Shorts retain audio embedded in the validated final MP4. Generic operator checks accept this evidence only for Shorts when:
+Topic-generated Shorts retain audio embedded in the validated final MP4. Phase 3C stores the validated file size and SHA-256 digest alongside its stream, codec, resolution, duration, container, and decode evidence. Approval recomputes the digest, checks the size, and reruns that same strict validator, so a same-path or same-size replacement cannot reuse stale evidence.
+
+Generic operator checks accept embedded-audio evidence only for Shorts when:
 
 - persisted embedded-audio validation passed;
 - an audio codec and positive duration are present;

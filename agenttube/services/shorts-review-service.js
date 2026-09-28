@@ -1,5 +1,6 @@
 const fs = require('fs').promises;
 const { OperatorService } = require('../utils/operator-service');
+const { validateVideoArtifact, hashFileSha256 } = require('./shorts-production-execution-service');
 
 const DECISIONS = new Set(['approve', 'reject', 'request-changes']);
 
@@ -13,9 +14,11 @@ class ShortsReviewError extends Error {
 }
 
 class ShortsReviewService {
-  constructor({ database, operator } = {}) {
+  constructor({ database, operator, artifactValidator = validateVideoArtifact, artifactHasher = hashFileSha256 } = {}) {
     this.database = database;
     this.operator = operator || new OperatorService(database);
+    this.artifactValidator = artifactValidator;
+    this.artifactHasher = artifactHasher;
   }
 
   async handoff(productionJobId) {
@@ -73,6 +76,7 @@ class ShortsReviewService {
     const now = new Date().toISOString();
     let notes;
     let editorData;
+    let candidateProvenance;
 
     if (action === 'approve') {
       const confirmations = input.confirmations || {};
@@ -83,22 +87,32 @@ class ShortsReviewService {
       }
       const privacyStatus = input.privacyStatus || bundle.editorData?.privacyStatus || 'private';
       if (!['private', 'unlisted', 'public'].includes(privacyStatus)) throw new ShortsReviewError('Privacy state is invalid', 'INVALID_PRIVACY_STATE');
+      const syntheticMediaDetermination = input.syntheticMediaDetermination;
+      if (!['contains_synthetic_media', 'does_not_contain_synthetic_media'].includes(syntheticMediaDetermination)) {
+        throw new ShortsReviewError('An explicit synthetic-media determination is required', 'SYNTHETIC_MEDIA_DETERMINATION_REQUIRED');
+      }
       const sources = bundle.provenance?.sources || [];
       const factCheckStatus = sources.length ? 'verified_with_reviewed_sources' : 'human_reviewed_no_recorded_sources';
+      const containsSyntheticMedia = syntheticMediaDetermination === 'contains_synthetic_media';
+      candidateProvenance = {
+        ...bundle.provenance,
+        containsSyntheticMedia,
+        status: sources.length ? 'verified' : 'operator_reviewed',
+        summary: {
+          ...(bundle.provenance?.summary || {}), factCheckStatus, humanReviewed: true,
+          syntheticMediaDetermination
+        },
+        reviewedAt: now
+      };
+      const finalGate = await this.runFinalApprovalGate(chain, bundle, candidateProvenance, confirmations, now);
       editorData = {
         ...(bundle.editorData || {}), reviewer, confirmations, decisionAction: action, factChecked: true,
         rightsConfirmed: true, metadataReviewed: true, privacyStatus,
         factCheckStatus, rightsStatus: 'confirmed', inputsLocked: true,
+        syntheticMediaDetermination, containsSyntheticMedia, finalApprovalGate: finalGate,
         approvedAt: now
       };
       notes = String(input.notes || 'Approved by operator').trim();
-      await this.database.saveContentProvenance(productionJobId, {
-        ...bundle.provenance,
-        status: sources.length ? 'verified' : 'operator_reviewed',
-        summary: { ...(bundle.provenance?.summary || {}), factCheckStatus, humanReviewed: true },
-        reviewedAt: now
-      });
-      for (const scene of bundle.scenes || []) await this.database.updateProductionScene(productionJobId, scene.id, { locked: true });
     } else {
       const reason = String(input.reason || input.notes || '').trim();
       if (!reason) throw new ShortsReviewError(`${action === 'reject' ? 'Rejection' : 'Change request'} reason is required`, action === 'reject' ? 'REJECTION_REASON_REQUIRED' : 'CHANGE_REASON_REQUIRED');
@@ -110,12 +124,91 @@ class ShortsReviewService {
       };
     }
 
-    const result = await this.database.saveContentReview(productionJobId, {
-      status: target, editorData, qualityChecks: bundle.qualityChecks,
+    const review = {
+      status: target, editorData,
+      qualityChecks: editorData?.finalApprovalGate?.qualityChecks || bundle.qualityChecks,
       reviewNotes: notes, reviewedAt: now
-    });
+    };
+    if (action === 'approve') {
+      const result = await this.database.saveShortsFinalApproval(productionJobId, {
+        provenance: candidateProvenance,
+        review,
+        sceneIds: (bundle.scenes || []).map(scene => scene.id)
+      });
+      return this.reviewResponse(result, chain);
+    }
+    const result = await this.database.saveContentReview(productionJobId, review);
     await this.database.updateProductionStatus(productionJobId, target);
     return this.reviewResponse(result, chain);
+  }
+
+  async runFinalApprovalGate(chain, bundle, candidateProvenance, confirmations, approvedAt) {
+    const persisted = chain.production.validation_result || {};
+    const required = ['file_size', 'sha256', 'duration_seconds', 'resolution', 'video_codec', 'audio_codec', 'container'];
+    const missing = required.filter(field => persisted[field] === undefined || persisted[field] === null || persisted[field] === '');
+    if (persisted.passed !== true || missing.length || !/^[a-f0-9]{64}$/i.test(String(persisted.sha256))) {
+      throw new ShortsReviewError('Phase 3C artifact validation evidence is incomplete', 'ARTIFACT_VALIDATION_EVIDENCE_INVALID', { missing });
+    }
+    if (Number(persisted.file_size) !== chain.artifactStat.size) {
+      throw new ShortsReviewError('Artifact size changed after Phase 3C validation', 'ARTIFACT_INTEGRITY_FAILED');
+    }
+
+    const observedSha256 = await this.artifactHasher(chain.production.artifact_path);
+    if (observedSha256 !== persisted.sha256) {
+      throw new ShortsReviewError('Artifact bytes changed after Phase 3C validation', 'ARTIFACT_INTEGRITY_FAILED');
+    }
+
+    let technicalValidation;
+    try {
+      technicalValidation = await this.artifactValidator(
+        chain.production.artifact_path,
+        chain.preparation.specification.duration_seconds
+      );
+    } catch (_error) {
+      throw new ShortsReviewError('Current artifact failed strict MP4 validation', 'FINAL_ARTIFACT_VALIDATION_FAILED');
+    }
+    const currentMissing = required.filter(field => technicalValidation?.[field] === undefined || technicalValidation?.[field] === null || technicalValidation?.[field] === '');
+    const evidenceMismatch = ['resolution', 'video_codec', 'audio_codec', 'container'].some(field => technicalValidation?.[field] !== persisted[field]) ||
+      Math.abs(Number(technicalValidation?.duration_seconds) - Number(persisted.duration_seconds)) > 0.01;
+    if (technicalValidation?.passed !== true || currentMissing.length || technicalValidation.sha256 !== observedSha256 ||
+        Number(technicalValidation.file_size) !== chain.artifactStat.size || evidenceMismatch) {
+      throw new ShortsReviewError('Current artifact validation is inconsistent with Phase 3C evidence', 'FINAL_ARTIFACT_VALIDATION_FAILED', { missing: currentMissing });
+    }
+
+    const candidate = {
+      ...bundle,
+      contentType: 'short',
+      provenance: candidateProvenance,
+      finalReviewEvidence: { factualContentReviewed: confirmations.factualContentReviewed === true },
+      assets: {
+        ...(bundle.assets || {}),
+        finalVideo: { ...(bundle.assets?.finalVideo || {}), validation: technicalValidation },
+        embeddedAudioValidation: {
+          passed: technicalValidation.passed === true && Boolean(technicalValidation.audio_codec),
+          audioCodec: technicalValidation.audio_codec,
+          durationSeconds: technicalValidation.duration_seconds,
+          sourceArtifactPath: chain.production.artifact_path
+        }
+      }
+    };
+    const profile = await this.database.getChannelProfile?.() || {};
+    const quality = await this.operator.runQualityChecks(candidate, profile);
+    if (!quality.passed) {
+      throw new ShortsReviewError('Final approval quality gate has blocking failures', 'FINAL_QUALITY_GATE_FAILED', {
+        blockingFailures: quality.blockingFailures
+      });
+    }
+    return {
+      passed: true,
+      approvedAt,
+      artifact: {
+        sha256: observedSha256,
+        fileSize: chain.artifactStat.size,
+        technicalValidation
+      },
+      qualityPassed: true,
+      qualityChecks: quality.checks
+    };
   }
 
   async requireCompletedChain(productionJobId) {

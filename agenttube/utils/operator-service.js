@@ -97,14 +97,20 @@ class OperatorService {
         : 'No blocked brand topics detected'));
 
     const provenance = production.provenance || {};
-    const provenancePassed = ['verified', 'not_required'].includes(provenance.status || 'not_required');
+    const humanReviewedWithoutSources = production.contentType === 'short' &&
+      production.finalReviewEvidence?.factualContentReviewed === true &&
+      provenance.status === 'operator_reviewed' && provenance.summary?.humanReviewed === true &&
+      provenance.summary?.factCheckStatus === 'human_reviewed_no_recorded_sources';
+    const provenancePassed = ['verified', 'not_required'].includes(provenance.status || 'not_required') || humanReviewedWithoutSources;
     const unresolved = Number(provenance.summary?.unresolvedClaims || 0);
     checks.push(this.check('provenance', provenancePassed,
       provenance.status === 'verified'
         ? `${provenance.summary?.resolvedClaims || 0} factual claims resolved against reviewed evidence`
         : provenance.status === 'not_required'
           ? 'No externally verifiable factual claims were declared'
-          : `${unresolved} factual claim${unresolved === 1 ? '' : 's'} still require evidence review`));
+          : humanReviewedWithoutSources
+            ? 'Human factual review completed without recorded research sources; provenance remains non-verified'
+            : `${unresolved} factual claim${unresolved === 1 ? '' : 's'} still require evidence review`));
 
     const discoverability = production.discoverability;
     if (discoverability) {
