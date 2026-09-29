@@ -38,7 +38,7 @@ class ShortsProductionExecutionService {
     const existing = await this.database.getProductionJobByPreparation(preparation.preparation_id);
     if (existing) {
       if (['FAILED', 'CANCELLED', 'TIMEOUT'].includes(existing.status)) {
-        if (existing.mpt_task_id) {
+        if (existing.mpt_task_id && existing.stage !== 'ARTIFACT_VALIDATION_FAILED') {
           try {
             const task = await this.client.get_task_status(existing.mpt_task_id);
             const lifecycle = task.lifecycle_status;
