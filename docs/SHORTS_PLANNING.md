@@ -13,6 +13,10 @@ npm run credentials:setup
 
 The workflow uses AgentTube's existing AI text-provider configuration. It does not select a paid provider or fall back to template-generated content. At least one provider supported by `AITextService` must be explicitly configured. API mutations use the existing optional `API_KEY` protection.
 
+`AITextService` selects the first provider whose key variable is set, in this order: `CLEANAPIS_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `MOONSHOT_API_KEY`, `MIMO_API_KEY`, `GLM_API_KEY`, then `GEMINI_API_KEY`. Every provider except Gemini speaks the OpenAI chat-completions protocol, so each accepts a `<PROVIDER>_BASE_URL` override (`OPENAI_BASE_URL`, `CLEANAPIS_BASE_URL`, `MOONSHOT_BASE_URL`, and so on) pointing at a self-hosted gateway, regional endpoint or proxy. The override must be an absolute `http`/`https` URL and is validated at construction; unset, each provider uses its documented endpoint. Clean APIs publishes no model list, so `CLEANAPIS_MODEL` is required for it — the service refuses to guess a model rather than borrowing another provider's default.
+
+There is no automatic failover between providers. The selected provider is used for all three planning agents, and a provider failure fails the job rather than silently degrading to a template.
+
 AgentTube currently has no configured general-purpose factual research provider. Consequently, normal artifacts contain empty `research.sources`, set `research.claimed_verified` to `false`, and include a warning that the plan is not fact-checked. A research integration may only claim verification when it returns real source records with titles and HTTP(S) URLs.
 
 ## API

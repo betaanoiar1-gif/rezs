@@ -48,7 +48,7 @@ Polling uses the existing bounded `MoneyPrinterTurboProductionService`. Submissi
 
 ## Artifact security and validation
 
-Downloads use the existing adapter protections: relative destinations under `MPT_ARTIFACT_DIR`, same-origin remote URLs, traversal and symlink rejection, no overwrite, non-empty output, temporary file, and atomic rename.
+Downloads use the existing adapter protections: relative destinations under `MPT_ARTIFACT_DIR`, same-origin remote URLs, traversal and symlink rejection, no overwrite, non-empty output, temporary file, and atomic rename. The response body is streamed to that temporary file rather than buffered in memory, so peak memory does not scale with artifact size, and a transfer that dies mid-stream leaves neither a destination file nor a leftover part file.
 
 After download, Phase 3C additionally requires:
 
@@ -57,9 +57,12 @@ After download, Phase 3C additionally requires:
 - vertical 9:16 orientation and at least 720×1280 resolution;
 - H.264/HEVC/VP9/AV1 video and AAC/Opus/MP3 audio;
 - duration within three seconds of the approved Phase 3B duration;
+- video and audio stream durations agreeing within two seconds;
 - complete FFmpeg decoding of both streams from beginning to end.
 
-FFprobe JSON is preferred; FFmpeg metadata parsing is the fallback. The validation result, size, duration, resolution, codecs, and documented three-second technical tolerance are persisted.
+The container reports the longer of its streams, so the container duration alone cannot prove the narration survived. A concat or mux mistake that leaves a full-length video track over a truncated audio track passes every other check and produces a Short that goes silent part-way through; comparing the two stream durations catches it. The two-second tolerance is wide enough for normal final-frame padding. Per-stream durations are optional, because the FFmpeg-metadata fallback cannot report them, and their absence is not treated as a failure.
+
+FFprobe JSON is preferred; FFmpeg metadata parsing is the fallback. The validation result, size, SHA-256, container duration, per-stream durations, resolution, codecs, and both documented tolerances are persisted.
 
 ## Error codes
 
