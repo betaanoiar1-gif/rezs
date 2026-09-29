@@ -41,6 +41,7 @@ module.exports = [
         setInterval: 'readonly',
         setTimeout: 'readonly',
         URL: 'readonly',
+        URLSearchParams: 'readonly',
         window: 'readonly',
         document: 'readonly',
         matchMedia: 'readonly',

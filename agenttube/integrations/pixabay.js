@@ -1,6 +1,7 @@
 const fsp = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+const { Logger } = require('../utils/logger');
 
 const API_BASE = 'https://pixabay.com/api/videos/';
 
@@ -20,6 +21,7 @@ class PixabayVideoClient {
     this.downloadDirectory = path.resolve(options.downloadDirectory || process.env.REZS_MPT_LOCAL_VIDEOS_DIR || path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos'));
     this.searchCacheDirectory = path.resolve(options.searchCacheDirectory || path.join(this.downloadDirectory, '.pixabay-search-cache'));
     this.searchCacheTtlMs = Number(options.searchCacheTtlMs || 24 * 60 * 60 * 1000);
+    this.logger = options.logger || new Logger('Pixabay');
     if (typeof this.fetch !== 'function') throw new PixabayError('A fetch implementation is required', 'CONFIG_ERROR');
   }
 
@@ -35,10 +37,8 @@ class PixabayVideoClient {
     await fsp.mkdir(this.searchCacheDirectory, { recursive: true });
     const cacheKey = crypto.createHash('sha256').update(params.toString()).digest('hex');
     const cachePath = path.join(this.searchCacheDirectory, `${cacheKey}.json`);
-    try {
-      const cached = JSON.parse(await fsp.readFile(cachePath, 'utf8'));
-      if (cached && Number(cached.cached_at) + this.searchCacheTtlMs > Date.now() && Array.isArray(cached.hits)) return cached.hits;
-    } catch {}
+    const cached = await this._readSearchCache(cachePath);
+    if (cached) return cached;
     const response = await this.fetch(`${API_BASE}?${params}`);
     if (!response.ok) throw new PixabayError(`Pixabay search failed with HTTP ${response.status}`, 'PIXABAY_HTTP_ERROR', { status: response.status });
     const data = await response.json();
@@ -63,10 +63,7 @@ class PixabayVideoClient {
     if (!sourceUrl) throw new PixabayError('Pixabay video URL is missing', 'INVALID_VIDEO_URL');
     await fsp.mkdir(this.downloadDirectory, { recursive: true });
     const target = path.join(this.downloadDirectory, `pixabay-${String(hit.id)}.mp4`);
-    try {
-      const stat = await fsp.stat(target);
-      if (stat.isFile() && stat.size > 0) return provenance(hit, variant, target);
-    } catch {}
+    if (await this._hasUsableFile(target)) return provenance(hit, variant, target);
     const response = await this.fetch(sourceUrl);
     if (!response.ok) throw new PixabayError(`Pixabay download failed with HTTP ${response.status}`, 'PIXABAY_DOWNLOAD_FAILED', { status: response.status });
     const bytes = Buffer.from(await response.arrayBuffer());
@@ -79,6 +76,53 @@ class PixabayVideoClient {
       await fsp.rm(temporary, { force: true }).catch(() => {});
     }
     return provenance(hit, variant, target);
+  }
+
+  /**
+   * Read a cached search result. A missing or expired entry is a normal cache
+   * miss and returns null. An unreadable or corrupt entry is also treated as a
+   * miss so a poisoned cache file can never block a live search, but it is
+   * logged so the condition stays observable instead of silently swallowed.
+   */
+  async _readSearchCache(cachePath) {
+    let raw;
+    try {
+      raw = await fsp.readFile(cachePath, 'utf8');
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        this.logger.warn(`Pixabay search cache unreadable (${error.code || 'unknown'}); performing a live search`);
+      }
+      return null;
+    }
+    try {
+      const cached = JSON.parse(raw);
+      if (cached && Number(cached.cached_at) + this.searchCacheTtlMs > Date.now() && Array.isArray(cached.hits)) {
+        return cached.hits;
+      }
+      return null;
+    } catch (error) {
+      this.logger.warn(`Pixabay search cache is corrupt (${error.message}); performing a live search`);
+      return null;
+    }
+  }
+
+  /**
+   * Report whether a previously downloaded asset can be reused. Only ENOENT
+   * means "not downloaded yet"; any other stat failure is a real filesystem
+   * problem and must surface rather than trigger a silent re-download.
+   */
+  async _hasUsableFile(target) {
+    try {
+      const stat = await fsp.stat(target);
+      return stat.isFile() && stat.size > 0;
+    } catch (error) {
+      if (error.code === 'ENOENT') return false;
+      throw new PixabayError(
+        `Cannot inspect cached Pixabay asset: ${error.code || error.message}`,
+        'LOCAL_STORAGE_ERROR',
+        { path: target }
+      );
+    }
   }
 }
 
