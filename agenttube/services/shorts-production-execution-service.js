@@ -38,7 +38,28 @@ class ShortsProductionExecutionService {
     const existing = await this.database.getProductionJobByPreparation(preparation.preparation_id);
     if (existing) {
       if (['FAILED', 'CANCELLED', 'TIMEOUT'].includes(existing.status)) {
-        throw new ShortsProductionExecutionError('A terminal production already exists for this preparation', 'PRODUCTION_ALREADY_EXISTS', { production_job_id: existing.job_id, status: existing.status });
+        const retryCount = Number(existing.retry_count || 0) + 1;
+        await this.database.updateProductionJob(existing.job_id, {
+          status: 'QUEUED',
+          stage: 'QUEUED',
+          mpt_task_id: null,
+          artifact_reference: null,
+          artifact_path: null,
+          validation_result: null,
+          last_error: null,
+          completed_at: null,
+          retry_count: retryCount
+        });
+        try {
+          await this.productionService.submit(existing.job_id, preparation.specification.mpt_request);
+          return { ...await this.database.getProductionJob(existing.job_id), reused: true, retried: true };
+        } catch (error) {
+          const message = sanitizeError(error);
+          await this.database.updateProductionJob(existing.job_id, {
+            status: 'FAILED', stage: 'SUBMISSION_FAILED', last_error: message, completed_at: new Date().toISOString()
+          });
+          throw new ShortsProductionExecutionError(message, 'MPT_SUBMISSION_FAILED', { production_job_id: existing.job_id, retry_count: retryCount });
+        }
       }
       if (existing.status === 'QUEUED' && !existing.mpt_task_id) {
         try {
