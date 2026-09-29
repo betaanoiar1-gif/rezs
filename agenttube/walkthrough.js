@@ -18,6 +18,26 @@ const { VideoProviderRegistry } = require('./utils/video-providers');
 
 // Everything a beginner needs to know about each provider, in one place
 const AI_PROVIDER_GUIDE = {
+  cleanapis: {
+    label: 'Clean APIs — OpenAI-compatible dynamic model catalog',
+    keyUrl: 'https://www.cleanapis.com/',
+    keyHint: 'your Clean APIs API key',
+    instructions: [
+      'Sign in to Clean APIs',
+      'Create or copy your API key',
+      'Choose a model from the Clean APIs model catalog'
+    ],
+    models: [],
+    defaultModel: null,
+    covers: 'OpenAI-compatible text generation; model is selected dynamically via CLEANAPIS_MODEL',
+    save(credentials, apiKey, model) {
+      credentials.aiProvider = { provider: 'cleanapis', apiKey, model };
+    },
+    validationCreds: (apiKey, model) => ({
+      aiProvider: { provider: 'cleanapis', apiKey, model }
+    }),
+    dynamicModel: true
+  },
   gemini: {
     label: 'Google Gemini — free text/TTS tiers; paid AI images',
     keyUrl: 'https://aistudio.google.com/apikey',
@@ -288,13 +308,22 @@ class SetupWalkthrough {
         return;
       }
 
-      const { model } = await inquirer.prompt([{
-        type: 'list',
-        name: 'model',
-        message: 'Model to use:',
-        choices: guide.models,
-        default: guide.defaultModel
-      }]);
+      let model = guide.defaultModel;
+      if (guide.dynamicModel) {
+        model = process.env.CLEANAPIS_MODEL || null;
+        if (!model) {
+          console.log(chalk.yellow('  Clean APIs requires a model ID from its model catalog (CLEANAPIS_MODEL).'));
+          return;
+        }
+      } else {
+        ({ model } = await inquirer.prompt([{
+          type: 'list',
+          name: 'model',
+          message: 'Model to use:',
+          choices: guide.models,
+          default: guide.defaultModel
+        }]));
+      }
 
       console.log(chalk.gray('  Testing your key with a tiny request...'));
       const ok = await this.validateAIKey(guide, apiKey.trim(), model);

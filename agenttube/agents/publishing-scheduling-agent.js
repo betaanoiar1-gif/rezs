@@ -158,7 +158,11 @@ class PublishingSchedulingAgent {
         const error = new Error('Publishing is blocked because Phase 3F approval evidence is missing or invalid');
         error.status = 409; error.code = 'APPROVAL_BLOCKED'; throw error;
       }
-      if (canonicalShort && !['verified', 'not_required'].includes(productionBundle.provenance?.status)) {
+      if (
+        productionBundle &&
+        productionBundle.provenance &&
+        !['verified', 'not_required'].includes(productionBundle.provenance.status)
+      ) {
         await this.blockScheduledPublish(scheduleEntry, 'Publishing provenance is no longer eligible');
         const error = new Error('Publishing is blocked until every factual claim is supported or explicitly waived');
         error.status = 409; error.code = 'PROVENANCE_BLOCKED'; throw error;
