@@ -182,26 +182,38 @@ class YouTubeAutomationAgent {
     const creds = this.credentials.credentials || {};
 
     const hasText = this.credentials.hasAITextProvider();
-    const hasGemini = Boolean(creds.gemini?.apiKey || process.env.GEMINI_API_KEY);
-    const hasImages = Boolean(creds.openai?.apiKey || process.env.OPENAI_API_KEY || hasGemini);
-    const hasTTS = Boolean(
-      creds.openai?.apiKey || process.env.OPENAI_API_KEY ||
-      creds.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY ||
-      creds.azureSpeech?.subscriptionKey || process.env.AZURE_SPEECH_KEY ||
-      hasGemini
-    );
     const hasFFmpeg = await checkFFmpeg();
     const hasUpload = Boolean(creds.youtube && this.credentials.tokens?.youtube);
 
     const capabilities = [
-      { name: 'Script & strategy generation', ok: hasText, hint: 'configure an AI provider (npm run credentials:setup)' },
-      { name: 'Image generation (visuals/thumbnails)', ok: hasImages, hint: 'requires an OpenAI or Gemini API key — otherwise gradient slides are used' },
-      { name: 'Voice narration (TTS)', ok: hasTTS, hint: 'configure OpenAI, Gemini, ElevenLabs, or Azure Speech — otherwise videos are silent' },
-      { name: 'Video assembly (FFmpeg)', ok: hasFFmpeg, hint: ffmpegInstallHint() },
-      { name: 'YouTube upload', ok: hasUpload, hint: 'run: npm run credentials:setup' }
+      {
+        name: 'Script & strategy generation',
+        ok: hasText,
+        hint: 'configure an AI text provider'
+      },
+      {
+        name: 'Source-based scene production',
+        ok: true,
+        hint: 'scenes use approved source/search assets'
+      },
+      {
+        name: 'Voice narration (MPT embedded TTS)',
+        ok: true,
+        hint: 'MoneyPrinterTurbo embedded narration is required for Shorts production'
+      },
+      {
+        name: 'Video assembly (FFmpeg)',
+        ok: hasFFmpeg,
+        hint: ffmpegInstallHint()
+      },
+      {
+        name: 'YouTube upload',
+        ok: hasUpload,
+        hint: 'run: npm run credentials:setup'
+      }
     ];
 
-    console.log(chalk.cyan('\n🔎 Capability check:'));
+    console.log(chalk.cyan('\n🔎 Production capabilities:'));
     for (const cap of capabilities) {
       if (cap.ok) {
         console.log(chalk.green(`  ✓ ${cap.name}`));
@@ -213,10 +225,10 @@ class YouTubeAutomationAgent {
     if (!hasFFmpeg) {
       this.logger.warn('FFmpeg is missing: no .mp4 files can be produced until it is installed.');
     }
-    console.log('');
-    return { hasText, hasImages, hasTTS, hasFFmpeg, hasUpload };
-  }
 
+    console.log('');
+    return { hasText, hasFFmpeg, hasUpload };
+  }
   requireAPIKey() {
     return (req, res, next) => {
       if (!process.env.API_KEY) {
