@@ -8,6 +8,11 @@ const { getFFprobePath, runFFmpeg } = require('../utils/ffmpeg');
 const execFileAsync = promisify(execFile);
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
 
+// How many times a single production may be resubmitted because MoneyPrinterTurbo
+// lost its task (typically an MPT restart). Bounded so an unreachable MPT fails
+// instead of resubmitting work forever.
+const MAX_LOST_TASK_RECOVERIES = 3;
+
 class ShortsProductionExecutionError extends Error {
   constructor(message, code = 'PRODUCTION_EXECUTION_FAILED', details = null) {
     super(message);
@@ -166,40 +171,8 @@ class ShortsProductionExecutionService {
       // so the already-finished task can be downloaded and validated.
     } else if (TERMINAL.has(job.status) && job.status !== 'TIMEOUT') return job;
 
-    if (job.status !== 'SUCCEEDED') try {
-      job = await this.productionService.poll(productionJobId);
-    } catch (error) {
-      // MPT keeps task state in memory by default. If MPT restarts, an otherwise
-      // valid REZS job can point at a task that no longer exists. Recover by
-      // resubmitting the same preparation through start(), with a hard retry cap
-      // so a persistent external failure cannot loop forever.
-      if (error?.code === 'MPT_TASK_NOT_FOUND' && Number(job.retry_count || 0) < 3) {
-        await this.database.updateProductionJob(productionJobId, {
-          status: 'TIMEOUT',
-          stage: 'MPT_TASK_LOST',
-          last_error: 'MPT task disappeared before completion; automatic recovery requested',
-          completed_at: new Date().toISOString()
-        });
-        try {
-          await this.start(job.preparation_id);
-          return this.execute(productionJobId);
-        } catch (recoveryError) {
-          const message = sanitizeError(recoveryError);
-          await this.database.updateProductionJob(productionJobId, {
-            status: 'FAILED',
-            stage: 'MPT_RECOVERY_FAILED',
-            last_error: message,
-            completed_at: new Date().toISOString()
-          });
-          throw new ShortsProductionExecutionError(message, 'MPT_RECOVERY_FAILED', {
-            production_job_id: productionJobId,
-            recovery: true
-          });
-        }
-      }
-      const message = sanitizeError(error);
-      await this.database.updateProductionJob(productionJobId, { status: 'FAILED', stage: 'MPT_FAILED', last_error: message, completed_at: new Date().toISOString() });
-      throw new ShortsProductionExecutionError(message, 'MPT_FAILED', { production_job_id: productionJobId });
+    if (job.status !== 'SUCCEEDED') {
+      job = await this._pollWithLostTaskRecovery(productionJobId, job);
     }
 
     if (job.status === 'TIMEOUT') {
@@ -319,6 +292,69 @@ class ShortsProductionExecutionService {
       status: 'SUCCEEDED', stage: 'ARTIFACT_DOWNLOADED', last_error: null,
       validation_result: validation, completed_at: new Date().toISOString()
     });
+  }
+
+  /**
+   * Poll MoneyPrinterTurbo, recovering from tasks it has forgotten.
+   *
+   * MPT keeps task state in memory by default, so a restart can leave a valid
+   * REZS job pointing at a task ID that no longer exists. Recovery resubmits
+   * the same approved specification through start(). The loop is bounded by
+   * MAX_LOST_TASK_RECOVERIES attempts, which start() records in retry_count,
+   * so a permanently unreachable MPT fails instead of recovering forever.
+   * This is an explicit loop rather than recursion so the attempt budget is
+   * observable and stack depth cannot grow with the number of retries.
+   */
+  async _pollWithLostTaskRecovery(productionJobId, initialJob) {
+    let job = initialJob;
+    for (;;) {
+      try {
+        return await this.productionService.poll(productionJobId);
+      } catch (error) {
+        const attempts = Number(job?.retry_count || 0);
+        if (error?.code !== 'MPT_TASK_NOT_FOUND' || attempts >= MAX_LOST_TASK_RECOVERIES) {
+          const message = sanitizeError(error);
+          await this.database.updateProductionJob(productionJobId, {
+            status: 'FAILED', stage: 'MPT_FAILED', last_error: message, completed_at: new Date().toISOString()
+          });
+          throw new ShortsProductionExecutionError(message, 'MPT_FAILED', { production_job_id: productionJobId });
+        }
+
+        // Record the lost task before resubmitting. If the process dies here the
+        // persisted row still describes reality: this job is not running.
+        await this.database.updateProductionJob(productionJobId, {
+          status: 'TIMEOUT',
+          stage: 'MPT_TASK_LOST',
+          last_error: 'MPT task disappeared before completion; automatic recovery requested',
+          completed_at: new Date().toISOString()
+        });
+
+        try {
+          await this.start(job.preparation_id);
+        } catch (recoveryError) {
+          const message = sanitizeError(recoveryError);
+          await this.database.updateProductionJob(productionJobId, {
+            status: 'FAILED', stage: 'MPT_RECOVERY_FAILED', last_error: message, completed_at: new Date().toISOString()
+          });
+          throw new ShortsProductionExecutionError(message, 'MPT_RECOVERY_FAILED', {
+            production_job_id: productionJobId, recovery: true
+          });
+        }
+
+        job = await this.database.getProductionJob(productionJobId);
+        if (Number(job?.retry_count || 0) <= attempts) {
+          // start() must record the new attempt; without that the budget can
+          // never be exhausted and this loop would not terminate.
+          const message = 'MPT recovery did not record a retry attempt';
+          await this.database.updateProductionJob(productionJobId, {
+            status: 'FAILED', stage: 'MPT_RECOVERY_FAILED', last_error: message, completed_at: new Date().toISOString()
+          });
+          throw new ShortsProductionExecutionError(message, 'MPT_RECOVERY_FAILED', {
+            production_job_id: productionJobId, recovery: true
+          });
+        }
+      }
+    }
   }
 
   async get(productionJobId) {

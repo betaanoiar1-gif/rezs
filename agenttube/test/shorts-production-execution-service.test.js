@@ -37,20 +37,26 @@ class MemoryDatabase {
   async updateProductionJob(id, changes) { this.jobs.set(id, { ...this.jobs.get(id), ...changes }); return this.getProductionJob(id); }
 }
 
-function harness({ prep = preparation(), submitError, pollResult, pollError, validator, task, downloadError } = {}) {
+function harness({ prep = preparation(), submitError, pollResult, pollError, pollErrorTimes = Infinity, validator, task, downloadError } = {}) {
   const database = new MemoryDatabase(prep);
   let submissions = 0;
   let submittedSpecification;
   let calibrationCalls = 0;
+  let pollFailures = 0;
+  let polls = 0;
   const productionService = {
     client: null,
     submit: async (id, specification) => {
       submissions += 1; submittedSpecification = specification;
       if (submitError) throw submitError;
-      return database.updateProductionJob(id, { status: 'RUNNING', stage: 'RENDERING', mpt_task_id: 'mpt-task-1' });
+      return database.updateProductionJob(id, { status: 'RUNNING', stage: 'RENDERING', mpt_task_id: `mpt-task-${submissions}` });
     },
     poll: async id => {
-      if (pollError) throw pollError;
+      polls += 1;
+      if (pollError && pollFailures < pollErrorTimes) {
+        pollFailures += 1;
+        throw pollError;
+      }
       const result = pollResult || { status: 'SUCCEEDED', stage: 'RENDERED' };
       return database.updateProductionJob(id, result);
     },
@@ -60,7 +66,9 @@ function harness({ prep = preparation(), submitError, pollResult, pollError, val
     }
   };
   const client = {
-    get_task_status: async () => task || ({ videos: ['/tasks/mpt-task-1/final-1.mp4'] }),
+    // Mirror MPT: the artifact reference always belongs to the task that is
+    // queried, so a resubmitted job must download its replacement task's file.
+    get_task_status: async taskId => task || ({ videos: [`/tasks/${taskId}/final-1.mp4`] }),
     calibrate_voice_rate: async ({ video_script, voice_name, target_duration, video_language, initial_rate }) => {
       calibrationCalls += 1;
       return {
@@ -89,7 +97,8 @@ function harness({ prep = preparation(), submitError, pollResult, pollError, val
     service,
     submissions: () => submissions,
     submittedSpecification: () => submittedSpecification,
-    calibrationCalls: () => calibrationCalls
+    calibrationCalls: () => calibrationCalls,
+    polls: () => polls
   };
 }
 
@@ -152,8 +161,10 @@ test('successful submission persists RUNNING', async () => {
 });
 
 test('lost MPT task is automatically resubmitted and recovered', async () => {
+  // Models an MPT restart: the first poll cannot find the task, the job is
+  // resubmitted, and the replacement task then completes normally.
   const lostTask = Object.assign(new Error('MPT task disappeared'), { code: 'MPT_TASK_NOT_FOUND' });
-  const h = harness({ pollError: lostTask });
+  const h = harness({ pollError: lostTask, pollErrorTimes: 1 });
   const first = await h.service.start('short_prep_test');
   const recovered = await h.service.execute(first.job_id);
   assert.equal(recovered.status, 'SUCCEEDED');
@@ -161,6 +172,23 @@ test('lost MPT task is automatically resubmitted and recovered', async () => {
   assert.equal(recovered.retry_count, 1);
   assert.equal(h.submissions(), 2);
   assert.equal(h.calibrationCalls(), 2);
+  // The replacement task ID must be the one that was polled and downloaded.
+  assert.equal(recovered.mpt_task_id, 'mpt-task-2');
+});
+
+test('permanently lost MPT task fails after a bounded number of recoveries', async () => {
+  // A permanently unreachable MPT must not resubmit work forever.
+  const lostTask = Object.assign(new Error('MPT task disappeared'), { code: 'MPT_TASK_NOT_FOUND' });
+  const h = harness({ pollError: lostTask });
+  const first = await h.service.start('short_prep_test');
+  await assert.rejects(h.service.execute(first.job_id), error => error.code === 'MPT_FAILED');
+  const stored = await h.database.getProductionJob(first.job_id);
+  assert.equal(stored.status, 'FAILED');
+  assert.equal(stored.stage, 'MPT_FAILED');
+  assert.equal(stored.retry_count, 3);
+  // One initial submission plus exactly three bounded recovery submissions.
+  assert.equal(h.submissions(), 4);
+  assert.ok(stored.completed_at, 'a terminal failure records completed_at');
 });
 
 test('MPT success downloads and validates the final artifact', async () => {
@@ -256,7 +284,9 @@ test('failed production retries the same job and submits a fresh MPT task', asyn
   assert.equal(retried.job_id, first.job_id);
   assert.equal(retried.status, 'RUNNING');
   assert.equal(retried.stage, 'RENDERING');
-  assert.equal(retried.mpt_task_id, 'mpt-task-1');
+  // The retry must be bound to a genuinely new MPT task, never the failed one.
+  assert.equal(retried.mpt_task_id, 'mpt-task-2');
+  assert.notEqual(retried.mpt_task_id, 'mpt-task-failed');
   assert.equal(retried.retried, true);
   assert.equal(retried.retry_count, 1);
   assert.equal(h.submissions(), 2);
