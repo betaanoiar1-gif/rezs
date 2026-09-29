@@ -32,7 +32,8 @@ const { ShortsProductionPreparationService, ProductionPreparationError } = requi
 const { ShortsProductionExecutionService, ShortsProductionExecutionError } = require('./services/shorts-production-execution-service');
 const { ShortsReviewService, ShortsReviewError } = require('./services/shorts-review-service');
 const { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService } = require('./integrations/moneyprinterturbo');
-const { PixabayVideoClient, PixabayError } = require('./integrations/pixabay');
+const { ShortsMaterialService, ShortsMaterialError } = require('./services/shorts-material-service');
+const { StockMediaError } = require('./integrations/stock-media');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -538,69 +539,28 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/planning/shorts/:jobId/prepare-production', protect, async (req, res) => {
       try {
-        const pixabay = new PixabayVideoClient();
+        const materials = new ShortsMaterialService();
         const service = new ShortsProductionPreparationService({
           database: this.db,
-          materialDiscovery: async plan => {
-            const terms = [...new Set(
-              (plan.scenes || []).flatMap(scene => scene.visual_search_terms || [])
-                .filter(term => typeof term === 'string' && term.trim())
-            )].slice(0, 8);
-
-            // Pixabay performs best with concrete, visually searchable phrases.
-            // AI-generated scene terms can contain abstract concepts such as
-            // "consistency" or "self-discipline", so try deterministic visual
-            // fallbacks instead of failing the whole preparation on one term.
-            const visualSearchCandidates = term => {
-              const normalized = String(term).trim().toLowerCase();
-              const fallbacks = {
-                consistency: ['daily habit', 'habit formation', 'person exercising', 'morning routine'],
-                'self discipline': ['person exercising', 'morning routine', 'focused person', 'daily routine'],
-                discipline: ['person exercising', 'focused person', 'daily routine'],
-                motivation: ['person exercising', 'success goal', 'morning routine'],
-                'personal growth': ['person learning', 'person exercising', 'success goal'],
-                productivity: ['working at desk', 'daily routine', 'focused person']
-              };
-              return [...new Set([term, ...(fallbacks[normalized] || []), `${term} habit`, `${term} routine`])];
-            };
-
-            const assets = [];
-            const attemptedTerms = [];
-            for (const term of terms) {
-              let asset = null;
-              for (const candidate of visualSearchCandidates(term)) {
-                attemptedTerms.push(candidate);
-                try {
-                  asset = await pixabay.downloadBest(candidate, { perPage: 8, safesearch: true });
-                  if (asset) break;
-                } catch (error) {
-                  if (error.code !== 'NO_VIDEO_RESULTS') throw error;
-                }
-              }
-              if (asset) assets.push(asset);
-            }
-
-            if (!assets.length) {
-              const error = new Error(`No usable Pixabay video found for visual terms: ${attemptedTerms.join(', ')}`);
-              error.code = 'NO_VIDEO_RESULTS';
-              throw error;
-            }
-            return assets.map(asset => ({
-              provider: 'local',
-              url: asset.local_name,
-              duration: asset.duration || 0
-            }));
-          }
+          materialDiscovery: plan => materials.discoverMaterials(plan)
         });
         const preparation = await service.prepare(req.params.jobId);
         return res.status(200).json({ success: true, preparation });
       } catch (error) {
         const status = error.code === 'PLANNING_JOB_NOT_FOUND' ? 404
           : error.code === 'INVALID_PLANNING_JOB_ID' ? 400
-            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED', 'PIXABAY_API_KEY_MISSING', 'NO_VIDEO_RESULTS'].includes(error.code) ? 422 : error instanceof PixabayError ? 502 : 500;
+            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED', 'NO_MEDIA_PROVIDER_CONFIGURED',
+              'NO_SEARCH_TERMS', 'NO_VIDEO_RESULTS'].includes(error.code) ? 422
+              : error instanceof StockMediaError ? 502 : 500;
         return res.status(status).json({
           success: false,
-          error: { code: error.code || 'PRODUCTION_PREPARATION_FAILED', message: error.message, details: error instanceof ProductionPreparationError ? error.details : null }
+          error: {
+            code: error.code || 'PRODUCTION_PREPARATION_FAILED',
+            message: error.message,
+            details: (error instanceof ProductionPreparationError || error instanceof ShortsMaterialError)
+              ? error.details
+              : null
+          }
         });
       }
     });

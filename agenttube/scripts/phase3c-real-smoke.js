@@ -13,6 +13,28 @@ const {
   MoneyPrinterTurboClient,
   MoneyPrinterTurboProductionService
 } = require('../integrations/moneyprinterturbo');
+const { ShortsMaterialService } = require('../services/shorts-material-service');
+
+/**
+ * Use the same acquisition path as POST /prepare-production whenever a stock
+ * provider is configured, so the smoke runner exercises what production does.
+ * With no provider configured it falls back to the preparation service's local
+ * directory scan, which keeps a fully offline run possible.
+ */
+function resolveMaterialDiscovery() {
+  if (String(process.env.REZS_SHORTS_LOCAL_MATERIALS_ONLY || '').toLowerCase() === 'true') {
+    console.log('Materials: local directory scan (REZS_SHORTS_LOCAL_MATERIALS_ONLY=true)');
+    return undefined;
+  }
+  const service = new ShortsMaterialService();
+  const configured = service.configuredProviders().map(provider => provider.provider);
+  if (!configured.length) {
+    console.log('Materials: local directory scan (no stock media provider configured)');
+    return undefined;
+  }
+  console.log(`Materials: stock providers in fallback order: ${configured.join(' -> ')}`);
+  return plan => service.discoverMaterials(plan);
+}
 
 async function main() {
   const planningJobId = String(process.env.PLANNING_JOB_ID || '').trim();
@@ -28,7 +50,10 @@ async function main() {
     console.log('Planning job:', planningJobId);
     console.log('MPT base URL:', process.env.MPT_BASE_URL || 'http://127.0.0.1:8080');
 
-    const preparationService = new ShortsProductionPreparationService({ database });
+    const preparationService = new ShortsProductionPreparationService({
+      database,
+      materialDiscovery: resolveMaterialDiscovery()
+    });
     const preparation = await preparationService.prepare(planningJobId);
 
     if (preparation.status !== 'PRODUCTION_READY' || preparation.quality_result?.passed !== true) {
