@@ -35,19 +35,54 @@ class ShortsProductionExecutionService {
       throw new ShortsProductionExecutionError('Production preparation has not passed all mandatory gates', 'PREPARATION_NOT_READY');
     }
 
-    // Apply the current runtime TTS rate to legacy preparations.
-    // Older preparations may contain voice_rate=1 even though the current
-    // approved runtime default is 0.82.
-    const runtimeVoiceRate = Number.isFinite(Number(process.env.MPT_VOICE_RATE))
-      ? Number(process.env.MPT_VOICE_RATE)
-      : 0.82;
+    const existing = await this.database.getProductionJobByPreparation(preparation.preparation_id);
 
-    const mptRequest = {
-      ...preparation.specification.mpt_request,
-      voice_rate: runtimeVoiceRate
+    // Resolve the runtime TTS rate lazily so existing/recoverable production
+    // jobs do not create unnecessary calibration audio tasks.
+    let resolvedVoiceRate = Number.isFinite(Number(process.env.MPT_VOICE_RATE))
+      ? Number(process.env.MPT_VOICE_RATE)
+      : null;
+
+    const resolveVoiceRate = async () => {
+      if (resolvedVoiceRate !== null) return resolvedVoiceRate;
+
+      if (typeof this.client.calibrate_voice_rate !== 'function') {
+        throw new ShortsProductionExecutionError(
+          'MPT voice calibration is unavailable',
+          'VOICE_CALIBRATION_UNAVAILABLE'
+        );
+      }
+
+      try {
+        const request = preparation.specification.mpt_request;
+        const calibration = await this.client.calibrate_voice_rate({
+          video_script: request.video_script,
+          voice_name: request.voice_name,
+          target_duration: preparation.specification.duration_seconds,
+          video_language: request.video_language || 'en',
+          initial_rate: 0.82
+        });
+
+        const calibratedRate = Number(calibration?.voice_rate);
+        if (!Number.isFinite(calibratedRate) || calibratedRate <= 0) {
+          throw new Error('Calibration returned an invalid voice rate');
+        }
+
+        resolvedVoiceRate = calibratedRate;
+        return resolvedVoiceRate;
+      } catch (error) {
+        if (error instanceof ShortsProductionExecutionError) throw error;
+        throw new ShortsProductionExecutionError(
+          `Voice calibration failed: ${sanitizeError(error)}`,
+          'VOICE_CALIBRATION_FAILED'
+        );
+      }
     };
 
-    const existing = await this.database.getProductionJobByPreparation(preparation.preparation_id);
+    const buildMptRequest = async () => ({
+      ...preparation.specification.mpt_request,
+      voice_rate: await resolveVoiceRate()
+    });
     if (existing) {
       if (['FAILED', 'CANCELLED', 'TIMEOUT'].includes(existing.status)) {
         if (existing.mpt_task_id && existing.stage !== 'ARTIFACT_VALIDATION_FAILED') {
@@ -80,7 +115,7 @@ class ShortsProductionExecutionService {
           retry_count: retryCount
         });
         try {
-          await this.productionService.submit(existing.job_id, mptRequest);
+          await this.productionService.submit(existing.job_id, await buildMptRequest());
           return { ...await this.database.getProductionJob(existing.job_id), reused: true, retried: true };
         } catch (error) {
           const message = sanitizeError(error);
@@ -92,7 +127,7 @@ class ShortsProductionExecutionService {
       }
       if (existing.status === 'QUEUED' && !existing.mpt_task_id) {
         try {
-          await this.productionService.submit(existing.job_id, mptRequest);
+          await this.productionService.submit(existing.job_id, await buildMptRequest());
           return { ...await this.database.getProductionJob(existing.job_id), reused: true };
         } catch (error) {
           const message = sanitizeError(error);
@@ -113,7 +148,7 @@ class ShortsProductionExecutionService {
     });
 
     try {
-      await this.productionService.submit(jobId, mptRequest);
+      await this.productionService.submit(jobId, await buildMptRequest());
       return this.database.getProductionJob(jobId);
     } catch (error) {
       const message = sanitizeError(error);

@@ -57,7 +57,24 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
       return database.updateProductionJob(id, { status: 'SUCCEEDED', stage: 'ARTIFACT_DOWNLOADED', artifact_reference: reference, artifact_path: '/safe/final.mp4' });
     }
   };
-  const client = { get_task_status: async () => task || ({ videos: ['/tasks/mpt-task-1/final-1.mp4'] }) };
+  const client = {
+    get_task_status: async () => task || ({ videos: ['/tasks/mpt-task-1/final-1.mp4'] }),
+    calibrate_voice_rate: async ({ video_script, voice_name, target_duration, video_language, initial_rate }) => ({
+      voice_rate: 0.91,
+      actual_duration: Number(target_duration),
+      target_duration: Number(target_duration),
+      error_seconds: 0,
+      iterations: 1,
+      within_tolerance: true,
+      calibration_input: {
+        video_script,
+        voice_name,
+        target_duration,
+        video_language,
+        initial_rate
+      }
+    })
+  };
   const service = new ShortsProductionExecutionService({
     database, client, productionService,
     artifactValidator: validator || (async () => ({ passed: true, file_size: 1234, duration_seconds: 70, resolution: '1080x1920', video_codec: 'h264', audio_codec: 'aac' }))
@@ -73,7 +90,7 @@ test('PRODUCTION_READY preparation submits the exact approved MPT request', asyn
   assert.equal(job.mpt_task_id, 'mpt-task-1');
   const expectedRequest = {
     ...approved.mpt_request,
-    voice_rate: 0.82
+    voice_rate: 0.91
   };
   assert.deepEqual(h.submittedSpecification(), expectedRequest);
   assert.deepEqual(h.database.prep.specification, approved);
