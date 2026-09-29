@@ -88,5 +88,10 @@ data/scripts/
 data/videos/
 data/thumbnails/
 
+# Run artifacts: downloaded MoneyPrinterTurbo renders and the report written
+# by scripts/e2e-full-pipeline.js. Both are outputs of a run, not source.
+data/mpt-artifacts/
+data/e2e-full-pipeline.json
+
 # Claude worktrees
 .claude/worktrees/
