@@ -613,7 +613,8 @@ def concat_video_clips_with_ffmpeg(
 
         effective_codec = _get_effective_video_codec()
         try:
-            return run_command(build_encode_command(effective_codec), effective_codec) or effective_codec
+            run_command(build_encode_command(effective_codec), effective_codec)
+            return effective_codec
         except TimeoutError:
             raise
         except Exception as exc:
@@ -624,7 +625,7 @@ def concat_video_clips_with_ffmpeg(
                 build_encode_command(_DEFAULT_VIDEO_CODEC), _DEFAULT_VIDEO_CODEC
             )
             _disable_runtime_video_codec(effective_codec, str(exc))
-            return result_codec or _DEFAULT_VIDEO_CODEC
+            return _DEFAULT_VIDEO_CODEC
     finally:
         delete_files(concat_list_file)
 
