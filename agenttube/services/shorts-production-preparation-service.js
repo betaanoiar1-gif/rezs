@@ -175,7 +175,10 @@ function buildProductionSpecification(plan, preparationId) {
       video_subject: plan.topic,
       video_script: plan.script,
       video_terms: searchTerms,
-      video_aspect: '9:16'
+      video_aspect: '9:16',
+      voice_name: String(process.env.MPT_VOICE_NAME || 'en-US-JennyNeural').trim(),
+      voice_rate: Number.isFinite(Number(process.env.MPT_VOICE_RATE)) ? Number(process.env.MPT_VOICE_RATE) : 1.0,
+      voice_volume: Number.isFinite(Number(process.env.MPT_VOICE_VOLUME)) ? Number(process.env.MPT_VOICE_VOLUME) : 1.0
     }
   };
 }
