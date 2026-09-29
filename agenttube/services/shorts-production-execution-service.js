@@ -114,9 +114,12 @@ class ShortsProductionExecutionService {
     let job = await this.database.getProductionJob(productionJobId);
     if (!job) throw new ShortsProductionExecutionError('Production job not found', 'PRODUCTION_NOT_FOUND');
     if (job.status === 'SUCCEEDED' && job.stage === 'ARTIFACT_DOWNLOADED') return job;
-    if (TERMINAL.has(job.status)) return job;
+    if (job.status === 'SUCCEEDED') {
+      // MPT may have completed after the polling timeout. Continue from RENDERED
+      // so the already-finished task can be downloaded and validated.
+    } else if (TERMINAL.has(job.status)) return job;
 
-    try {
+    if (job.status !== 'SUCCEEDED') try {
       job = await this.productionService.poll(productionJobId);
     } catch (error) {
       const message = sanitizeError(error);
