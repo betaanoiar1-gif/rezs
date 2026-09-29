@@ -35,6 +35,18 @@ class ShortsProductionExecutionService {
       throw new ShortsProductionExecutionError('Production preparation has not passed all mandatory gates', 'PREPARATION_NOT_READY');
     }
 
+    // Apply the current runtime TTS rate to legacy preparations.
+    // Older preparations may contain voice_rate=1 even though the current
+    // approved runtime default is 0.75.
+    const runtimeVoiceRate = Number.isFinite(Number(process.env.MPT_VOICE_RATE))
+      ? Number(process.env.MPT_VOICE_RATE)
+      : 0.75;
+
+    const mptRequest = {
+      ...preparation.specification.mpt_request,
+      voice_rate: runtimeVoiceRate
+    };
+
     const existing = await this.database.getProductionJobByPreparation(preparation.preparation_id);
     if (existing) {
       if (['FAILED', 'CANCELLED', 'TIMEOUT'].includes(existing.status)) {
@@ -68,7 +80,7 @@ class ShortsProductionExecutionService {
           retry_count: retryCount
         });
         try {
-          await this.productionService.submit(existing.job_id, preparation.specification.mpt_request);
+          await this.productionService.submit(existing.job_id, mptRequest);
           return { ...await this.database.getProductionJob(existing.job_id), reused: true, retried: true };
         } catch (error) {
           const message = sanitizeError(error);
@@ -80,7 +92,7 @@ class ShortsProductionExecutionService {
       }
       if (existing.status === 'QUEUED' && !existing.mpt_task_id) {
         try {
-          await this.productionService.submit(existing.job_id, preparation.specification.mpt_request);
+          await this.productionService.submit(existing.job_id, mptRequest);
           return { ...await this.database.getProductionJob(existing.job_id), reused: true };
         } catch (error) {
           const message = sanitizeError(error);
@@ -101,7 +113,7 @@ class ShortsProductionExecutionService {
     });
 
     try {
-      await this.productionService.submit(jobId, preparation.specification.mpt_request);
+      await this.productionService.submit(jobId, mptRequest);
       return this.database.getProductionJob(jobId);
     } catch (error) {
       const message = sanitizeError(error);
@@ -117,7 +129,7 @@ class ShortsProductionExecutionService {
     if (job.status === 'SUCCEEDED') {
       // MPT may have completed after the polling timeout. Continue from RENDERED
       // so the already-finished task can be downloaded and validated.
-    } else if (TERMINAL.has(job.status)) return job;
+    } else if (TERMINAL.has(job.status) && job.status !== 'TIMEOUT') return job;
 
     if (job.status !== 'SUCCEEDED') try {
       job = await this.productionService.poll(productionJobId);
@@ -128,9 +140,51 @@ class ShortsProductionExecutionService {
     }
 
     if (job.status === 'TIMEOUT') {
-      const message = sanitizeError(job.last_error || 'MoneyPrinterTurbo polling timed out');
-      await this.database.updateProductionJob(productionJobId, { last_error: message, completed_at: job.completed_at || new Date().toISOString() });
-      throw new ShortsProductionExecutionError(message, 'MPT_TIMEOUT', { production_job_id: productionJobId });
+      // The polling window may expire just before MPT finishes rendering.
+      // Re-check the existing task once before declaring the production failed.
+      if (job.mpt_task_id) {
+        try {
+          const task = await this.client.get_task_status(job.mpt_task_id);
+          if (task.lifecycle_status === 'SUCCEEDED') {
+            job = await this.database.updateProductionJob(productionJobId, {
+              status: 'SUCCEEDED',
+              stage: 'RENDERED',
+              last_error: null,
+              completed_at: null
+            });
+          } else if (task.lifecycle_status === 'RUNNING') {
+            await this.database.updateProductionJob(productionJobId, {
+              status: 'RUNNING',
+              stage: 'RENDERING',
+              last_error: null
+            });
+            return this.database.getProductionJob(productionJobId);
+          } else if (task.lifecycle_status === 'FAILED' || task.lifecycle_status === 'CANCELLED') {
+            const message = sanitizeError(
+              task.error || task.failed_stage || 'MoneyPrinterTurbo production failed'
+            );
+            job = await this.database.updateProductionJob(productionJobId, {
+              status: task.lifecycle_status,
+              stage: task.lifecycle_status,
+              last_error: message,
+              completed_at: new Date().toISOString()
+            });
+          }
+        } catch (_error) {
+          // Preserve the existing timeout behavior if the task cannot be reached.
+        }
+      }
+
+      if (job.status === 'TIMEOUT') {
+        const message = sanitizeError(job.last_error || 'MoneyPrinterTurbo polling timed out');
+        await this.database.updateProductionJob(productionJobId, {
+          last_error: message,
+          completed_at: job.completed_at || new Date().toISOString()
+        });
+        throw new ShortsProductionExecutionError(message, 'MPT_TIMEOUT', {
+          production_job_id: productionJobId
+        });
+      }
     }
     if (job.status === 'FAILED' || job.status === 'CANCELLED') {
       const message = sanitizeError(job.last_error || 'MoneyPrinterTurbo production failed');
@@ -144,8 +198,39 @@ class ShortsProductionExecutionService {
     try {
       task = await this.client.get_task_status(job.mpt_task_id);
       artifactReference = resolveArtifactReference(task, job.mpt_task_id);
-      await this.database.updateProductionJob(productionJobId, { artifact_reference: artifactReference, stage: 'DOWNLOADING_ARTIFACT' });
-      job = await this.productionService.downloadArtifact(productionJobId, artifactReference, 'final.mp4');
+      await this.database.updateProductionJob(productionJobId, {
+        artifact_reference: artifactReference,
+        stage: 'DOWNLOADING_ARTIFACT'
+      });
+
+      // Recovery is idempotent: if this exact MPT attempt already has
+      // a downloaded artifact, reuse it instead of downloading again.
+      if (job.artifact_path) {
+        try {
+          const existingArtifact = await fs.stat(job.artifact_path);
+          if (existingArtifact.isFile() && existingArtifact.size > 0) {
+            // Keep the existing artifact and continue to validation.
+          } else {
+            job = await this.productionService.downloadArtifact(
+              productionJobId,
+              artifactReference,
+              'final.mp4'
+            );
+          }
+        } catch (_error) {
+          job = await this.productionService.downloadArtifact(
+            productionJobId,
+            artifactReference,
+            'final.mp4'
+          );
+        }
+      } else {
+        job = await this.productionService.downloadArtifact(
+          productionJobId,
+          artifactReference,
+          'final.mp4'
+        );
+      }
     } catch (error) {
       const message = sanitizeError(error);
       await this.database.updateProductionJob(productionJobId, { status: 'FAILED', stage: 'ARTIFACT_DOWNLOAD_FAILED', last_error: message, completed_at: new Date().toISOString() });
