@@ -189,15 +189,39 @@ function buildProductionSpecification(plan, preparationId) {
 
 function discoverLocalVideoMaterials() {
   const configuredDirectory = String(process.env.REZS_SHORTS_MATERIALS_DIR || '').trim();
-  const defaultDirectory = path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos');
-  const directory = path.resolve(configuredDirectory || defaultDirectory);
+  const managedDirectory = path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos');
+  const sourceDirectory = path.resolve(configuredDirectory || managedDirectory);
   const allowed = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.flv', '.jpg', '.jpeg', '.png']);
+
   try {
-    const entries = fs.readdirSync(directory, { withFileTypes: true });
-    return entries
+    const entries = fs.readdirSync(sourceDirectory, { withFileTypes: true });
+    const sourceFiles = entries
       .filter(entry => entry.isFile() && allowed.has(path.extname(entry.name).toLowerCase()))
-      .map(entry => ({ provider: 'local', url: entry.name, duration: 0 }))
-      .sort((a, b) => a.url.localeCompare(b.url));
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    fs.mkdirSync(managedDirectory, { recursive: true });
+
+    return sourceFiles.map(entry => {
+      const sourcePath = path.join(sourceDirectory, entry.name);
+      const sourceStat = fs.statSync(sourcePath);
+      const sameDirectory = path.resolve(sourceDirectory) === path.resolve(managedDirectory);
+      let managedName = entry.name;
+
+      if (!sameDirectory) {
+        const fingerprint = crypto
+          .createHash('sha256')
+          .update(`${sourcePath}:${sourceStat.size}:${sourceStat.mtimeMs}`)
+          .digest('hex')
+          .slice(0, 12);
+        managedName = `rezs-material-${fingerprint}-${entry.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        const managedPath = path.join(managedDirectory, managedName);
+        if (!fs.existsSync(managedPath) || fs.statSync(managedPath).size !== sourceStat.size) {
+          fs.copyFileSync(sourcePath, managedPath);
+        }
+      }
+
+      return { provider: 'local', url: managedName, duration: 0 };
+    });
   } catch (_error) {
     return [];
   }
