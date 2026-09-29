@@ -43,7 +43,7 @@ async function main() {
       client,
       database,
       pollIntervalMs: Number(process.env.MPT_POLL_INTERVAL_MS || 2000),
-      maxPolls: Number(process.env.MPT_MAX_POLLS || 300)
+      maxPolls: Number(process.env.MPT_MAX_POLLS || 900)
     });
     const execution = new ShortsProductionExecutionService({
       database,
