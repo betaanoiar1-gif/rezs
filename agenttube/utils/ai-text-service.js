@@ -54,6 +54,30 @@ const PROVIDERS = {
   },
 };
 
+/** `OPENAI_API_KEY` -> `OPENAI_BASE_URL`, `CLEANAPIS_API_KEY` -> `CLEANAPIS_BASE_URL`. */
+function baseUrlEnvKey(preset) {
+  return `${preset.envKey.replace(/_API_KEY$/, '')}_BASE_URL`;
+}
+
+/**
+ * An operator-supplied endpoint must be a real absolute http(s) URL. A typo
+ * that reaches the OpenAI client surfaces much later as an opaque request
+ * failure, so it is rejected here where the cause is still obvious.
+ */
+function normaliseBaseURL(value) {
+  const candidate = String(value || '').trim();
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error(`Invalid AI provider base URL: ${candidate}`);
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new Error(`AI provider base URL must be http or https: ${candidate}`);
+  }
+  return candidate;
+}
+
 class AITextService {
   constructor(credentials = {}) {
     this.logger = new Logger('AITextService');
@@ -71,7 +95,7 @@ class AITextService {
     const model = credentials.aiProvider?.model;
 
     if (provider && PROVIDERS[provider] && apiKey) {
-      return this._initOpenAICompatible(PROVIDERS[provider], apiKey, model);
+      return this._initOpenAICompatible(PROVIDERS[provider], apiKey, model, credentials.aiProvider?.baseURL);
     }
 
     for (const [, preset] of Object.entries(PROVIDERS)) {
@@ -90,11 +114,23 @@ class AITextService {
     this.logger.warn('No AI text provider configured — text generation unavailable');
   }
 
-  _initOpenAICompatible(preset, apiKey, model) {
-    this.client = new OpenAI({ apiKey, baseURL: preset.baseURL });
+  /**
+   * Every provider here speaks the OpenAI chat-completions protocol, but the
+   * endpoint was hard-coded per provider, so pointing the same provider at a
+   * self-hosted gateway, a regional endpoint or a proxy required editing this
+   * file. `<PROVIDER>_BASE_URL` overrides the endpoint without touching the
+   * selection logic; unset, behaviour is exactly the preset default.
+   */
+  _initOpenAICompatible(preset, apiKey, model, baseURLOverride) {
+    const baseURL = normaliseBaseURL(
+      baseURLOverride || process.env[baseUrlEnvKey(preset)] || preset.baseURL
+    );
+    this.client = new OpenAI({ apiKey, baseURL });
     this.model = model || preset.defaultModel;
     this.providerName = preset.name;
-    this.logger.info(`${preset.name} initialized (model: ${this.model})`);
+    this.baseURL = baseURL;
+    const custom = baseURL !== preset.baseURL ? ` at ${baseURL}` : '';
+    this.logger.info(`${preset.name} initialized (model: ${this.model})${custom}`);
   }
 
   _initGemini(apiKey, model) {
@@ -194,4 +230,4 @@ class AITextService {
   }
 }
 
-module.exports = { AITextService, PROVIDERS, GEMINI_MODELS, GEMINI_DEFAULT_MODEL };
+module.exports = { AITextService, PROVIDERS, GEMINI_MODELS, GEMINI_DEFAULT_MODEL, baseUrlEnvKey, normaliseBaseURL };
