@@ -37,7 +37,7 @@ class MemoryDatabase {
   async updateProductionJob(id, changes) { this.jobs.set(id, { ...this.jobs.get(id), ...changes }); return this.getProductionJob(id); }
 }
 
-function harness({ prep = preparation(), submitError, pollResult, validator, task, downloadError } = {}) {
+function harness({ prep = preparation(), submitError, pollResult, pollError, validator, task, downloadError } = {}) {
   const database = new MemoryDatabase(prep);
   let submissions = 0;
   let submittedSpecification;
@@ -50,6 +50,7 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
       return database.updateProductionJob(id, { status: 'RUNNING', stage: 'RENDERING', mpt_task_id: 'mpt-task-1' });
     },
     poll: async id => {
+      if (pollError) throw pollError;
       const result = pollResult || { status: 'SUCCEEDED', stage: 'RENDERED' };
       return database.updateProductionJob(id, result);
     },
@@ -148,6 +149,18 @@ test('successful submission persists RUNNING', async () => {
   const job = await h.service.start('short_prep_test');
   assert.equal(job.status, 'RUNNING');
   assert.equal((await h.service.get(job.job_id)).status, 'RUNNING');
+});
+
+test('lost MPT task is automatically resubmitted and recovered', async () => {
+  const lostTask = Object.assign(new Error('MPT task disappeared'), { code: 'MPT_TASK_NOT_FOUND' });
+  const h = harness({ pollError: lostTask });
+  const first = await h.service.start('short_prep_test');
+  const recovered = await h.service.execute(first.job_id);
+  assert.equal(recovered.status, 'SUCCEEDED');
+  assert.equal(recovered.stage, 'ARTIFACT_DOWNLOADED');
+  assert.equal(recovered.retry_count, 1);
+  assert.equal(h.submissions(), 2);
+  assert.equal(h.calibrationCalls(), 2);
 });
 
 test('MPT success downloads and validates the final artifact', async () => {
