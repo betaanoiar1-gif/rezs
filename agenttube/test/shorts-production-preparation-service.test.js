@@ -63,6 +63,29 @@ async function rejected(artifact) {
   return { error, preparation };
 }
 
+/**
+ * Material discovery falls back to MoneyPrinterTurbo's real storage directory,
+ * so a test that does not stage its own footage silently depends on whatever
+ * happens to be on the developer's disk. Every test that expects a
+ * production-ready result stages its own clip in an isolated directory.
+ */
+async function isolatedMaterials(t) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-'));
+  await fs.writeFile(path.join(directory, 'material-a.mp4'), Buffer.alloc(8));
+  const previousSource = process.env.REZS_SHORTS_MATERIALS_DIR;
+  const previousManaged = process.env.REZS_MPT_LOCAL_VIDEOS_DIR;
+  process.env.REZS_SHORTS_MATERIALS_DIR = directory;
+  process.env.REZS_MPT_LOCAL_VIDEOS_DIR = directory;
+  t.after(async () => {
+    if (previousSource === undefined) delete process.env.REZS_SHORTS_MATERIALS_DIR;
+    else process.env.REZS_SHORTS_MATERIALS_DIR = previousSource;
+    if (previousManaged === undefined) delete process.env.REZS_MPT_LOCAL_VIDEOS_DIR;
+    else process.env.REZS_MPT_LOCAL_VIDEOS_DIR = previousManaged;
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+  return directory;
+}
+
 test('configured local Shorts materials are staged into MPT managed storage', async () => {
   const sourceDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-source-'));
   const managedDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-managed-'));
@@ -90,7 +113,8 @@ test('configured local Shorts materials are staged into MPT managed storage', as
   }
 });
 
-test('valid planning job becomes production-ready with an MPT specification', async () => {
+test('valid planning job becomes production-ready with an MPT specification', async t => {
+  await isolatedMaterials(t);
   const database = new MemoryDatabase();
   const result = await new ShortsProductionPreparationService({ database }).prepare('short_plan_valid');
   assert.equal(result.status, 'PRODUCTION_READY');
@@ -161,6 +185,7 @@ test('failed quality gate never invokes MoneyPrinterTurbo', async () => {
 });
 
 test('successful preparation persists and retrieves through SQLite', async t => {
+  await isolatedMaterials(t);
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-preparation-'));
   const database = new Database();
   database.dbPath = path.join(directory, 'test.db');
@@ -177,7 +202,8 @@ test('successful preparation persists and retrieves through SQLite', async t => 
   assert.equal(await database.getProductionJob(result.preparation_id), undefined);
 });
 
-test('repeated preparation is deterministic and idempotent', async () => {
+test('repeated preparation is deterministic and idempotent', async t => {
+  await isolatedMaterials(t);
   const database = new MemoryDatabase();
   const service = new ShortsProductionPreparationService({ database });
   const first = await service.prepare('short_plan_valid');

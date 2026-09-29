@@ -550,7 +550,7 @@ class YouTubeAutomationAgent {
         const status = error.code === 'PLANNING_JOB_NOT_FOUND' ? 404
           : error.code === 'INVALID_PLANNING_JOB_ID' ? 400
             : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED', 'NO_MEDIA_PROVIDER_CONFIGURED',
-              'NO_SEARCH_TERMS', 'NO_VIDEO_RESULTS'].includes(error.code) ? 422
+              'NO_SEARCH_TERMS', 'NO_VIDEO_RESULTS', 'NO_PRODUCTION_MATERIALS'].includes(error.code) ? 422
               : error instanceof StockMediaError ? 502 : 500;
         return res.status(status).json({
           success: false,

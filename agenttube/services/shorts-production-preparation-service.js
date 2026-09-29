@@ -48,6 +48,30 @@ class ShortsProductionPreparationService {
     }
 
     const specification = await buildProductionSpecification(planningJob.artifact, preparationId, this.materialDiscovery);
+
+    // Material acquisition happens after the plan-quality gate, so its outcome
+    // was never checked. An empty list still reached MoneyPrinterTurbo as a
+    // "local" render with nothing to show, which fails deep inside rendering
+    // or produces an unusable video. A preparation with no footage is not
+    // production-ready, and saying so here keeps the failure at the stage
+    // that caused it.
+    if (!specification.mpt_request.video_materials.length) {
+      const failures = [{
+        code: 'NO_PRODUCTION_MATERIALS',
+        field: 'video_materials',
+        message: 'No usable video material was acquired for this plan'
+      }];
+      const result = { ...quality, passed: false, failures: [...(quality.failures || []), ...failures] };
+      const rejected = await this.database.updateShortsProductionPreparation(preparationId, {
+        status: 'REJECTED', quality_result: result, specification: null
+      });
+      throw new ProductionPreparationError(
+        'No usable video material was acquired for this plan',
+        'NO_PRODUCTION_MATERIALS',
+        { preparation_id: preparationId, planning_job_id: planningJob.job_id, failures, preparation: rejected }
+      );
+    }
+
     await this.database.updateShortsProductionPreparation(preparationId, {
       status: 'PRODUCTION_READY', quality_result: quality, specification
     });
@@ -224,8 +248,18 @@ function discoverLocalVideoMaterials() {
 
       return { provider: 'local', url: managedName, duration: 0 };
     });
-  } catch (_error) {
-    return [];
+  } catch (error) {
+    // An absent directory genuinely means "no local material is staged", and
+    // the caller turns that into a clear NO_PRODUCTION_MATERIALS rejection.
+    // Every other failure — unreadable directory, a copy that ran out of
+    // space, an I/O error — is a fault. Reporting those as "no materials"
+    // used to hide them behind an empty list and let production continue.
+    if (error.code === 'ENOENT') return [];
+    throw new ProductionPreparationError(
+      `Local material discovery failed at ${sourceDirectory}: ${error.message}`,
+      'MATERIAL_DISCOVERY_FAILED',
+      { directory: sourceDirectory, cause_code: error.code || null }
+    );
   }
 }
 
