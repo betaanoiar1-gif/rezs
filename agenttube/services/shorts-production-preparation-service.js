@@ -47,7 +47,7 @@ class ShortsProductionPreparationService {
       });
     }
 
-    const specification = buildProductionSpecification(planningJob.artifact, preparationId, this.materialDiscovery);
+    const specification = await buildProductionSpecification(planningJob.artifact, preparationId, this.materialDiscovery);
     await this.database.updateShortsProductionPreparation(preparationId, {
       status: 'PRODUCTION_READY', quality_result: quality, specification
     });
@@ -155,7 +155,7 @@ function validateProductionPlan(plan) {
   };
 }
 
-function buildProductionSpecification(plan, preparationId, materialDiscovery = discoverLocalVideoMaterials) {
+async function buildProductionSpecification(plan, preparationId, materialDiscovery = discoverLocalVideoMaterials) {
   const searchTerms = [...new Set(plan.scenes.flatMap(scene => scene.visual_search_terms).filter(string))];
   return {
     schema_version: 1,
@@ -183,7 +183,7 @@ function buildProductionSpecification(plan, preparationId, materialDiscovery = d
       voice_rate: Number.isFinite(Number(process.env.MPT_VOICE_RATE)) ? Number(process.env.MPT_VOICE_RATE) : 0.82,
       voice_volume: Number.isFinite(Number(process.env.MPT_VOICE_VOLUME)) ? Number(process.env.MPT_VOICE_VOLUME) : 1.0,
       video_source: 'local',
-      video_materials: materialDiscovery()
+      video_materials: await materialDiscovery(plan)
     }
   };
 }
