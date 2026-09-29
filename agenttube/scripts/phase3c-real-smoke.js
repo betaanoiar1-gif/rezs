@@ -97,23 +97,22 @@ main().catch(async error => {
       const database = new Database();
       await database.initialize();
       try {
-        const planning = await database.getShortsPlanningJob(planningJobId);
-        const preparationId = planning?.preparation_id;
-        const preparation = preparationId
-          ? await database.getShortsProductionPreparation(preparationId)
-          : null;
-        const productionJob = preparationId
-          ? await database.getShortsProductionJobByPreparationId(preparationId)
+        const preparation = await database.getShortsProductionPreparationByPlanningJob(planningJobId);
+        const productionJob = preparation
+          ? await database.getProductionJobByPreparation(preparation.preparation_id)
           : null;
 
         console.error('=== ARTIFACT VALIDATION DETAILS ===');
         console.error(JSON.stringify({
           approved_duration_seconds: preparation?.specification?.duration_seconds ?? null,
           voice_rate: preparation?.specification?.mpt_request?.voice_rate ?? null,
-          production_job_id: productionJob?.job_id ?? null,
+          production_job_id: productionJob?.job_id ?? error?.details?.production_job_id ?? null,
           mpt_task_id: productionJob?.mpt_task_id ?? null,
           artifact_path: productionJob?.artifact_path ?? null,
-          validation_result: productionJob?.validation_result ?? error?.validation ?? null
+          validation_result:
+            error?.details?.validation ||
+            productionJob?.validation_result ||
+            null
         }, null, 2));
       } finally {
         if (typeof database.close === 'function') {
