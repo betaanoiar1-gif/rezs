@@ -41,6 +41,7 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
   const database = new MemoryDatabase(prep);
   let submissions = 0;
   let submittedSpecification;
+  let calibrationCalls = 0;
   const productionService = {
     client: null,
     submit: async (id, specification) => {
@@ -59,7 +60,9 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
   };
   const client = {
     get_task_status: async () => task || ({ videos: ['/tasks/mpt-task-1/final-1.mp4'] }),
-    calibrate_voice_rate: async ({ video_script, voice_name, target_duration, video_language, initial_rate }) => ({
+    calibrate_voice_rate: async ({ video_script, voice_name, target_duration, video_language, initial_rate }) => {
+      calibrationCalls += 1;
+      return {
       voice_rate: 0.91,
       actual_duration: Number(target_duration),
       target_duration: Number(target_duration),
@@ -73,13 +76,20 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
         video_language,
         initial_rate
       }
-    })
+      };
+    }
   };
   const service = new ShortsProductionExecutionService({
     database, client, productionService,
     artifactValidator: validator || (async () => ({ passed: true, file_size: 1234, duration_seconds: 70, resolution: '1080x1920', video_codec: 'h264', audio_codec: 'aac' }))
   });
-  return { database, service, submissions: () => submissions, submittedSpecification: () => submittedSpecification };
+  return {
+    database,
+    service,
+    submissions: () => submissions,
+    submittedSpecification: () => submittedSpecification,
+    calibrationCalls: () => calibrationCalls
+  };
 }
 
 test('PRODUCTION_READY preparation submits the exact approved MPT request', async () => {
@@ -94,6 +104,23 @@ test('PRODUCTION_READY preparation submits the exact approved MPT request', asyn
   };
   assert.deepEqual(h.submittedSpecification(), expectedRequest);
   assert.deepEqual(h.database.prep.specification, approved);
+});
+
+test('MPT_VOICE_RATE override bypasses adaptive calibration', async () => {
+  const previous = process.env.MPT_VOICE_RATE;
+  process.env.MPT_VOICE_RATE = '1.17';
+
+  try {
+    const h = harness();
+    const job = await h.service.start('short_prep_test');
+
+    assert.equal(job.status, 'RUNNING');
+    assert.equal(h.submittedSpecification().voice_rate, 1.17);
+    assert.equal(h.calibrationCalls(), 0);
+  } finally {
+    if (previous === undefined) delete process.env.MPT_VOICE_RATE;
+    else process.env.MPT_VOICE_RATE = previous;
+  }
 });
 
 test('REJECTED preparation cannot bypass Phase 3B', async () => {
