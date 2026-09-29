@@ -73,7 +73,7 @@ test('PRODUCTION_READY preparation submits the exact approved MPT request', asyn
   assert.equal(job.mpt_task_id, 'mpt-task-1');
   const expectedRequest = {
     ...approved.mpt_request,
-    voice_rate: 0.75
+    voice_rate: 0.82
   };
   assert.deepEqual(h.submittedSpecification(), expectedRequest);
   assert.deepEqual(h.database.prep.specification, approved);

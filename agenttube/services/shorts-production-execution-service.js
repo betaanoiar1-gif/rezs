@@ -37,10 +37,10 @@ class ShortsProductionExecutionService {
 
     // Apply the current runtime TTS rate to legacy preparations.
     // Older preparations may contain voice_rate=1 even though the current
-    // approved runtime default is 0.75.
+    // approved runtime default is 0.82.
     const runtimeVoiceRate = Number.isFinite(Number(process.env.MPT_VOICE_RATE))
       ? Number(process.env.MPT_VOICE_RATE)
-      : 0.75;
+      : 0.82;
 
     const mptRequest = {
       ...preparation.specification.mpt_request,
