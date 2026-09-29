@@ -38,6 +38,23 @@ class ShortsProductionExecutionService {
     const existing = await this.database.getProductionJobByPreparation(preparation.preparation_id);
     if (existing) {
       if (['FAILED', 'CANCELLED', 'TIMEOUT'].includes(existing.status)) {
+        if (existing.mpt_task_id) {
+          try {
+            const task = await this.client.get_task_status(existing.mpt_task_id);
+            const lifecycle = task.lifecycle_status;
+            if (lifecycle === 'SUCCEEDED' || lifecycle === 'RUNNING') {
+              await this.database.updateProductionJob(existing.job_id, {
+                status: lifecycle === 'SUCCEEDED' ? 'SUCCEEDED' : 'RUNNING',
+                stage: lifecycle === 'SUCCEEDED' ? 'RENDERED' : 'RENDERING',
+                last_error: null,
+                completed_at: null
+              });
+              return { ...await this.database.getProductionJob(existing.job_id), reused: true, recovered: true };
+            }
+          } catch (_error) {
+            // Fall through to a fresh retry when the old MPT task is no longer reachable.
+          }
+        }
         const retryCount = Number(existing.retry_count || 0) + 1;
         await this.database.updateProductionJob(existing.job_id, {
           status: 'QUEUED',
