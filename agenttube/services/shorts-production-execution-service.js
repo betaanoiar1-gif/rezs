@@ -360,7 +360,10 @@ async function validateVideoArtifact(filePath, approvedDuration, options = {}) {
     if (probe.audio && !['aac', 'opus', 'mp3'].includes(String(probe.audio.codec).toLowerCase())) failures.push('Audio codec is not compatible');
     const duration = Number(probe.duration);
     if (!Number.isFinite(duration) || duration <= 0) failures.push('Artifact duration is invalid');
-    else if (Math.abs(duration - Number(approvedDuration)) > 3) failures.push('Artifact duration differs from the approved duration by more than 3 seconds');
+    else {
+      if (duration < 60 || duration > 120) failures.push('Artifact duration is outside the YouTube Shorts production range of 60–120 seconds');
+      if (Math.abs(duration - Number(approvedDuration)) > 3) failures.push('Artifact duration differs from the approved duration by more than 3 seconds');
+    }
   }
   if (!failures.length) {
     try { await (options.decode || decodeVideoArtifact)(filePath); }
