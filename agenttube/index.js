@@ -546,10 +546,44 @@ class YouTubeAutomationAgent {
               (plan.scenes || []).flatMap(scene => scene.visual_search_terms || [])
                 .filter(term => typeof term === 'string' && term.trim())
             )].slice(0, 8);
+
+            // Pixabay performs best with concrete, visually searchable phrases.
+            // AI-generated scene terms can contain abstract concepts such as
+            // "consistency" or "self-discipline", so try deterministic visual
+            // fallbacks instead of failing the whole preparation on one term.
+            const visualSearchCandidates = term => {
+              const normalized = String(term).trim().toLowerCase();
+              const fallbacks = {
+                consistency: ['daily habit', 'habit formation', 'person exercising', 'morning routine'],
+                'self discipline': ['person exercising', 'morning routine', 'focused person', 'daily routine'],
+                discipline: ['person exercising', 'focused person', 'daily routine'],
+                motivation: ['person exercising', 'success goal', 'morning routine'],
+                'personal growth': ['person learning', 'person exercising', 'success goal'],
+                productivity: ['working at desk', 'daily routine', 'focused person']
+              };
+              return [...new Set([term, ...(fallbacks[normalized] || []), `${term} habit`, `${term} routine`])];
+            };
+
             const assets = [];
+            const attemptedTerms = [];
             for (const term of terms) {
-              const asset = await pixabay.downloadBest(term, { perPage: 8, safesearch: true });
-              assets.push(asset);
+              let asset = null;
+              for (const candidate of visualSearchCandidates(term)) {
+                attemptedTerms.push(candidate);
+                try {
+                  asset = await pixabay.downloadBest(candidate, { perPage: 8, safesearch: true });
+                  if (asset) break;
+                } catch (error) {
+                  if (error.code !== 'NO_VIDEO_RESULTS') throw error;
+                }
+              }
+              if (asset) assets.push(asset);
+            }
+
+            if (!assets.length) {
+              const error = new Error(`No usable Pixabay video found for visual terms: ${attemptedTerms.join(', ')}`);
+              error.code = 'NO_VIDEO_RESULTS';
+              throw error;
             }
             return assets.map(asset => ({
               provider: 'local',
