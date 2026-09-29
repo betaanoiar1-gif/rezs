@@ -893,11 +893,14 @@ class TestVideoService(unittest.TestCase):
                         output_dir=temp_dir,
                     )
 
-        used_codecs = [
-            call.args[0][call.args[0].index("-c:v") + 1]
-            for call in run.call_args_list
-        ]
-        self.assertEqual(used_codecs, ["h264_nvenc", "libx264"])
+        used_codecs = []
+        for call in run.call_args_list:
+            command = call.args[0]
+            if "-c:v" in command:
+                used_codecs.append(command[command.index("-c:v") + 1])
+            else:
+                used_codecs.append("copy")
+        self.assertEqual(used_codecs, ["copy", "h264_nvenc", "libx264"])
         self.assertIn("h264_nvenc", vd._runtime_disabled_video_codecs)
 
     def test_concat_video_clips_does_not_disable_codec_when_fallback_also_fails(self):
