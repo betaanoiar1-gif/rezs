@@ -19,7 +19,11 @@ class MptError extends Error {
 
 class MoneyPrinterTurboClient {
   constructor(options = {}) {
-    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8090').replace(/\/$/, '');
+    // MoneyPrinterTurbo's own default listen_port is 8080 (config.example.toml,
+    // app/config/config.py). Keep the adapter default aligned with the service
+    // it talks to; non-default deployments (Colab tunnels, containers) set
+    // MPT_BASE_URL instead of relying on a divergent built-in default.
+    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
     this.connectTimeoutMs = positive(options.connectTimeoutMs ?? process.env.MPT_CONNECT_TIMEOUT_MS, 5000);
     this.readTimeoutMs = positive(options.readTimeoutMs ?? process.env.MPT_READ_TIMEOUT_MS, 30000);
     this.maxRetries = nonnegative(options.maxRetries ?? process.env.MPT_MAX_RETRIES, 2);
