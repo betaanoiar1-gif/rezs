@@ -169,6 +169,34 @@ class ShortsProductionExecutionService {
     if (job.status !== 'SUCCEEDED') try {
       job = await this.productionService.poll(productionJobId);
     } catch (error) {
+      // MPT keeps task state in memory by default. If MPT restarts, an otherwise
+      // valid REZS job can point at a task that no longer exists. Recover by
+      // resubmitting the same preparation through start(), with a hard retry cap
+      // so a persistent external failure cannot loop forever.
+      if (error?.code === 'MPT_TASK_NOT_FOUND' && Number(job.retry_count || 0) < 3) {
+        await this.database.updateProductionJob(productionJobId, {
+          status: 'TIMEOUT',
+          stage: 'MPT_TASK_LOST',
+          last_error: 'MPT task disappeared before completion; automatic recovery requested',
+          completed_at: new Date().toISOString()
+        });
+        try {
+          await this.start(job.preparation_id);
+          return this.execute(productionJobId);
+        } catch (recoveryError) {
+          const message = sanitizeError(recoveryError);
+          await this.database.updateProductionJob(productionJobId, {
+            status: 'FAILED',
+            stage: 'MPT_RECOVERY_FAILED',
+            last_error: message,
+            completed_at: new Date().toISOString()
+          });
+          throw new ShortsProductionExecutionError(message, 'MPT_RECOVERY_FAILED', {
+            production_job_id: productionJobId,
+            recovery: true
+          });
+        }
+      }
       const message = sanitizeError(error);
       await this.database.updateProductionJob(productionJobId, { status: 'FAILED', stage: 'MPT_FAILED', last_error: message, completed_at: new Date().toISOString() });
       throw new ShortsProductionExecutionError(message, 'MPT_FAILED', { production_job_id: productionJobId });
