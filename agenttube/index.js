@@ -32,6 +32,7 @@ const { ShortsProductionPreparationService, ProductionPreparationError } = requi
 const { ShortsProductionExecutionService, ShortsProductionExecutionError } = require('./services/shorts-production-execution-service');
 const { ShortsReviewService, ShortsReviewError } = require('./services/shorts-review-service');
 const { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService } = require('./integrations/moneyprinterturbo');
+const { PixabayVideoClient, PixabayError } = require('./integrations/pixabay');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -537,13 +538,32 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/planning/shorts/:jobId/prepare-production', protect, async (req, res) => {
       try {
-        const service = new ShortsProductionPreparationService({ database: this.db });
+        const pixabay = new PixabayVideoClient();
+        const service = new ShortsProductionPreparationService({
+          database: this.db,
+          materialDiscovery: async plan => {
+            const terms = [...new Set(
+              (plan.scenes || []).flatMap(scene => scene.visual_search_terms || [])
+                .filter(term => typeof term === 'string' && term.trim())
+            )].slice(0, 8);
+            const assets = [];
+            for (const term of terms) {
+              const asset = await pixabay.downloadBest(term, { perPage: 8, safesearch: true });
+              assets.push(asset);
+            }
+            return assets.map(asset => ({
+              provider: 'local',
+              url: asset.local_name,
+              duration: asset.duration || 0
+            }));
+          }
+        });
         const preparation = await service.prepare(req.params.jobId);
         return res.status(200).json({ success: true, preparation });
       } catch (error) {
         const status = error.code === 'PLANNING_JOB_NOT_FOUND' ? 404
           : error.code === 'INVALID_PLANNING_JOB_ID' ? 400
-            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED'].includes(error.code) ? 422 : 500;
+            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED', 'PIXABAY_API_KEY_MISSING', 'NO_VIDEO_RESULTS'].includes(error.code) ? 422 : error instanceof PixabayError ? 502 : 500;
         return res.status(status).json({
           success: false,
           error: { code: error.code || 'PRODUCTION_PREPARATION_FAILED', message: error.message, details: error instanceof ProductionPreparationError ? error.details : null }
