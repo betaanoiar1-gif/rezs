@@ -63,6 +63,30 @@ async function rejected(artifact) {
   return { error, preparation };
 }
 
+test('configured local Shorts materials are staged into MPT managed storage', async () => {
+  const sourceDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-source-'));
+  const managedDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-managed-'));
+  const previousSource = process.env.REZS_SHORTS_MATERIALS_DIR;
+  const previousManaged = require('path').resolve;
+  try {
+    await fs.writeFile(path.join(sourceDirectory, 'anime-a.mp4'), Buffer.alloc(8));
+    process.env.REZS_SHORTS_MATERIALS_DIR = sourceDirectory;
+
+    const database = new MemoryDatabase();
+    const result = await new ShortsProductionPreparationService({ database }).prepare('short_plan_valid');
+    const materials = result.specification.mpt_request.video_materials;
+
+    assert.equal(materials.length, 1);
+    assert.equal(materials[0].provider, 'local');
+    assert.match(materials[0].url, /^rezs-material-[a-f0-9]{12}-anime-a\.mp4$/);
+  } finally {
+    if (previousSource === undefined) delete process.env.REZS_SHORTS_MATERIALS_DIR;
+    else process.env.REZS_SHORTS_MATERIALS_DIR = previousSource;
+    await fs.rm(sourceDirectory, { recursive: true, force: true });
+    await fs.rm(managedDirectory, { recursive: true, force: true });
+  }
+});
+
 test('valid planning job becomes production-ready with an MPT specification', async () => {
   const database = new MemoryDatabase();
   const result = await new ShortsProductionPreparationService({ database }).prepare('short_plan_valid');
