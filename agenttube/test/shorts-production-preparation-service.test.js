@@ -67,10 +67,11 @@ test('configured local Shorts materials are staged into MPT managed storage', as
   const sourceDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-source-'));
   const managedDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'shorts-materials-managed-'));
   const previousSource = process.env.REZS_SHORTS_MATERIALS_DIR;
-  const previousManaged = require('path').resolve;
+  const previousManaged = process.env.REZS_MPT_LOCAL_VIDEOS_DIR;
   try {
     await fs.writeFile(path.join(sourceDirectory, 'anime-a.mp4'), Buffer.alloc(8));
     process.env.REZS_SHORTS_MATERIALS_DIR = sourceDirectory;
+    process.env.REZS_MPT_LOCAL_VIDEOS_DIR = managedDirectory;
 
     const database = new MemoryDatabase();
     const result = await new ShortsProductionPreparationService({ database }).prepare('short_plan_valid');
@@ -82,6 +83,8 @@ test('configured local Shorts materials are staged into MPT managed storage', as
   } finally {
     if (previousSource === undefined) delete process.env.REZS_SHORTS_MATERIALS_DIR;
     else process.env.REZS_SHORTS_MATERIALS_DIR = previousSource;
+    if (previousManaged === undefined) delete process.env.REZS_MPT_LOCAL_VIDEOS_DIR;
+    else process.env.REZS_MPT_LOCAL_VIDEOS_DIR = previousManaged;
     await fs.rm(sourceDirectory, { recursive: true, force: true });
     await fs.rm(managedDirectory, { recursive: true, force: true });
   }
