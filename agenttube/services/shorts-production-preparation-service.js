@@ -189,7 +189,8 @@ function buildProductionSpecification(plan, preparationId) {
 
 function discoverLocalVideoMaterials() {
   const configuredDirectory = String(process.env.REZS_SHORTS_MATERIALS_DIR || '').trim();
-  const managedDirectory = path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos');
+  const configuredManagedDirectory = String(process.env.REZS_MPT_LOCAL_VIDEOS_DIR || '').trim();
+  const managedDirectory = path.resolve(configuredManagedDirectory || path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos'));
   const sourceDirectory = path.resolve(configuredDirectory || managedDirectory);
   const allowed = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.flv', '.jpg', '.jpeg', '.png']);
 
