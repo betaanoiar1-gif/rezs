@@ -85,8 +85,45 @@ async function main() {
   }
 }
 
-main().catch(error => {
+main().catch(async error => {
   console.error('=== REAL PHASE 3C FAILED ===');
   console.error(error?.stack || error);
+
+  // Expose the persisted validation details so duration/codec/path failures
+  // can be diagnosed from a single smoke-test run without manual DB queries.
+  try {
+    const planningJobId = String(process.env.PLANNING_JOB_ID || '').trim();
+    if (planningJobId && error?.code === 'ARTIFACT_VALIDATION_FAILED') {
+      const database = new Database();
+      await database.initialize();
+      try {
+        const planning = await database.getShortsPlanningJob(planningJobId);
+        const preparationId = planning?.preparation_id;
+        const preparation = preparationId
+          ? await database.getShortsProductionPreparation(preparationId)
+          : null;
+        const productionJob = preparationId
+          ? await database.getShortsProductionJobByPreparationId(preparationId)
+          : null;
+
+        console.error('=== ARTIFACT VALIDATION DETAILS ===');
+        console.error(JSON.stringify({
+          approved_duration_seconds: preparation?.specification?.duration_seconds ?? null,
+          voice_rate: preparation?.specification?.mpt_request?.voice_rate ?? null,
+          production_job_id: productionJob?.job_id ?? null,
+          mpt_task_id: productionJob?.mpt_task_id ?? null,
+          artifact_path: productionJob?.artifact_path ?? null,
+          validation_result: productionJob?.validation_result ?? error?.validation ?? null
+        }, null, 2));
+      } finally {
+        if (typeof database.close === 'function') {
+          await database.close();
+        }
+      }
+    }
+  } catch (diagnosticError) {
+    console.error('Validation diagnostics unavailable:', diagnosticError?.message || diagnosticError);
+  }
+
   process.exitCode = 1;
 });
