@@ -71,7 +71,7 @@ test('valid planning job becomes production-ready with an MPT specification', as
   assert.equal(result.specification.production_state, 'PRODUCTION_READY');
   assert.equal(result.specification.mpt_request.video_aspect, '9:16');
   assert.equal(result.specification.mpt_request.voice_name, 'en-US-JennyNeural');
-  assert.equal(result.specification.mpt_request.voice_rate, 1);
+  assert.equal(result.specification.mpt_request.voice_rate, 0.75);
   assert.equal(result.specification.mpt_request.voice_volume, 1);
   assert.equal(result.specification.provenance.fact_checking, 'not_performed');
 });
