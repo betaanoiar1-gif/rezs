@@ -19,7 +19,7 @@ class MptError extends Error {
 
 class MoneyPrinterTurboClient {
   constructor(options = {}) {
-    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
+    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8090').replace(/\/$/, '');
     this.connectTimeoutMs = positive(options.connectTimeoutMs ?? process.env.MPT_CONNECT_TIMEOUT_MS, 5000);
     this.readTimeoutMs = positive(options.readTimeoutMs ?? process.env.MPT_READ_TIMEOUT_MS, 30000);
     this.maxRetries = nonnegative(options.maxRetries ?? process.env.MPT_MAX_RETRIES, 2);
@@ -309,7 +309,10 @@ class MoneyPrinterTurboClient {
         const response = await this._fetchOnce(url, options);
         if (!response.ok) {
           const transient = response.status === 408 || response.status === 429 || response.status >= 500;
-          throw new MptError(`MPT request failed with HTTP ${response.status}`, { code: 'HTTP_ERROR', status: response.status, transient });
+          const code = response.status === 404 && /\/api\/v1\/tasks\//.test(url)
+            ? 'MPT_TASK_NOT_FOUND'
+            : 'HTTP_ERROR';
+          throw new MptError(`MPT request failed with HTTP ${response.status}`, { code, status: response.status, transient });
         }
         if (options.raw) return response;
         const text = await this._readText(response);
