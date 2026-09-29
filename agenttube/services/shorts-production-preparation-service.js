@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 class ProductionPreparationError extends Error {
   constructor(message, code = 'PRODUCTION_PREPARATION_FAILED', details = null) {
@@ -178,9 +180,27 @@ function buildProductionSpecification(plan, preparationId) {
       video_aspect: '9:16',
       voice_name: String(process.env.MPT_VOICE_NAME || 'en-US-JennyNeural').trim(),
       voice_rate: Number.isFinite(Number(process.env.MPT_VOICE_RATE)) ? Number(process.env.MPT_VOICE_RATE) : 0.82,
-      voice_volume: Number.isFinite(Number(process.env.MPT_VOICE_VOLUME)) ? Number(process.env.MPT_VOICE_VOLUME) : 1.0
+      voice_volume: Number.isFinite(Number(process.env.MPT_VOICE_VOLUME)) ? Number(process.env.MPT_VOICE_VOLUME) : 1.0,
+      video_source: 'local',
+      video_materials: discoverLocalVideoMaterials()
     }
   };
+}
+
+function discoverLocalVideoMaterials() {
+  const configuredDirectory = String(process.env.REZS_SHORTS_MATERIALS_DIR || '').trim();
+  const defaultDirectory = path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos');
+  const directory = path.resolve(configuredDirectory || defaultDirectory);
+  const allowed = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.flv', '.jpg', '.jpeg', '.png']);
+  try {
+    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    return entries
+      .filter(entry => entry.isFile() && allowed.has(path.extname(entry.name).toLowerCase()))
+      .map(entry => ({ provider: 'local', url: entry.name, duration: 0 }))
+      .sort((a, b) => a.url.localeCompare(b.url));
+  } catch (_error) {
+    return [];
+  }
 }
 
 function string(value) { return typeof value === 'string' && value.trim().length > 0; }
