@@ -18,6 +18,8 @@ class PixabayVideoClient {
     this.apiKey = String(options.apiKey || process.env.PIXABAY_API_KEY || '').trim();
     this.fetch = options.fetch || globalThis.fetch;
     this.downloadDirectory = path.resolve(options.downloadDirectory || process.env.REZS_MPT_LOCAL_VIDEOS_DIR || path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos'));
+    this.searchCacheDirectory = path.resolve(options.searchCacheDirectory || path.join(this.downloadDirectory, '.pixabay-search-cache'));
+    this.searchCacheTtlMs = Number(options.searchCacheTtlMs || 24 * 60 * 60 * 1000);
     if (typeof this.fetch !== 'function') throw new PixabayError('A fetch implementation is required', 'CONFIG_ERROR');
   }
 
@@ -30,10 +32,19 @@ class PixabayVideoClient {
       min_width: '720', min_height: '405', order: 'popular',
       per_page: String(Math.min(20, Math.max(3, perPage)))
     });
+    await fsp.mkdir(this.searchCacheDirectory, { recursive: true });
+    const cacheKey = crypto.createHash('sha256').update(params.toString()).digest('hex');
+    const cachePath = path.join(this.searchCacheDirectory, `${cacheKey}.json`);
+    try {
+      const cached = JSON.parse(await fsp.readFile(cachePath, 'utf8'));
+      if (cached && Number(cached.cached_at) + this.searchCacheTtlMs > Date.now() && Array.isArray(cached.hits)) return cached.hits;
+    } catch {}
     const response = await this.fetch(`${API_BASE}?${params}`);
     if (!response.ok) throw new PixabayError(`Pixabay search failed with HTTP ${response.status}`, 'PIXABAY_HTTP_ERROR', { status: response.status });
     const data = await response.json();
-    return Array.isArray(data.hits) ? data.hits : [];
+    const hits = Array.isArray(data.hits) ? data.hits : [];
+    await fsp.writeFile(cachePath, JSON.stringify({ cached_at: Date.now(), query: query.trim(), hits }), 'utf8');
+    return hits;
   }
 
   async downloadBest(query, options = {}) {
