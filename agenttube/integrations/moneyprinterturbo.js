@@ -234,7 +234,8 @@ class MoneyPrinterTurboProductionService {
   async downloadArtifact(jobId, artifactReference, filename = 'final.mp4') {
     const job = await this.database.getProductionJob(jobId);
     if (!job || job.status !== 'SUCCEEDED') throw new MptError('Only successful production jobs can download artifacts', { code: 'INVALID_JOB' });
-    const relativePath = path.join(jobId, filename);
+    const attemptId = String(job.mpt_task_id || `retry-${job.retry_count || 0}`);
+    const relativePath = path.join(jobId, attemptId, filename);
     const artifact = await this.client.download_artifact(artifactReference, relativePath);
     return this.database.updateProductionJob(jobId, { stage: 'ARTIFACT_DOWNLOADED', artifact_path: artifact.path, last_error: null });
   }
