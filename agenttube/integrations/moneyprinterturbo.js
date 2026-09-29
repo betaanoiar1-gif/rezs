@@ -3,6 +3,7 @@ const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
 const { Logger } = require('../utils/logger');
+const { getMediaDuration } = require('../utils/ffmpeg');
 
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
 const VALID_STATUSES = new Set(['QUEUED', 'SUBMITTED', 'RUNNING', ...TERMINAL]);
@@ -155,43 +156,36 @@ class MoneyPrinterTurboClient {
 
       const audioPath = path.join(taskDir, 'audio.mp3');
 
+      // Measure with the same FFmpeg/FFprobe resolution the rest of the
+      // project uses (FFMPEG_PATH / FFPROBE_PATH, bundled binary, then PATH).
+      // Calling a bare "ffprobe" ignored those settings and failed on any host
+      // where FFmpeg is installed somewhere other than the system PATH.
       let actualDuration = 0;
+      let lastMeasurementError = null;
       for (let check = 0; check < 20; check += 1) {
         try {
           const stat = await fsp.stat(audioPath);
           if (stat.isFile() && stat.size > 0) {
-            const { execFile } = require('child_process');
-            const duration = await new Promise((resolve, reject) => {
-              execFile(
-                'ffprobe',
-                [
-                  '-v', 'error',
-                  '-show_entries', 'format=duration',
-                  '-of', 'default=noprint_wrappers=1:nokey=1',
-                  audioPath,
-                ],
-                { timeout: 15000 },
-                (error, stdout) => {
-                  if (error) return reject(error);
-                  resolve(Number.parseFloat(String(stdout).trim()));
-                }
-              );
-            });
-
+            const duration = await getMediaDuration(audioPath);
             if (Number.isFinite(duration) && duration > 0) {
               actualDuration = duration;
               break;
             }
           }
-        } catch {
-          // MPT may still be finalizing the file.
+        } catch (error) {
+          // ENOENT simply means MPT has not finished writing the file yet.
+          if (error.code !== 'ENOENT') lastMeasurementError = error;
         }
         await sleep(250);
       }
 
       if (!(actualDuration > 0)) {
         throw new MptError(
-          `Unable to measure calibrated MPT audio task ${taskId}`,
+          `Unable to measure calibrated MPT audio task ${taskId} at ${audioPath}. ` +
+          'Voice calibration reads MoneyPrinterTurbo\'s task storage directly, so it ' +
+          'requires MPT_STORAGE_DIR to point at a locally readable storage/tasks ' +
+          'directory. Set MPT_VOICE_RATE to skip calibration when MPT is remote.' +
+          (lastMeasurementError ? ` Last error: ${lastMeasurementError.message}` : ''),
           { code: 'MPT_AUDIO_DURATION_UNAVAILABLE' }
         );
       }
@@ -249,16 +243,55 @@ class MoneyPrinterTurboClient {
     await fsp.mkdir(path.dirname(target), { recursive: true });
     const temporary = `${target}.${crypto.randomUUID()}.part`;
     try {
-      const bytes = Buffer.from(await this._withReadTimeout(response.arrayBuffer(), 'MPT artifact read timed out'));
-      if (!bytes.length) throw new MptError('Downloaded artifact is empty', { code: 'EMPTY_ARTIFACT' });
-      await fsp.writeFile(temporary, bytes, { flag: 'wx' });
+      const written = await this._withReadTimeout(
+        this._streamToFile(response, temporary),
+        'MPT artifact read timed out'
+      );
+      if (!written) throw new MptError('Downloaded artifact is empty', { code: 'EMPTY_ARTIFACT' });
       await fsp.rename(temporary, target);
       const stat = await fsp.stat(target);
       if (!stat.isFile() || stat.size < 1) throw new MptError('Downloaded artifact is invalid', { code: 'EMPTY_ARTIFACT' });
       return { path: target, size: stat.size };
     } finally {
-      await fsp.rm(temporary, { force: true }).catch(() => {});
+      await fsp.rm(temporary, { force: true }).catch(() => {
+        this.logger.warn('Could not remove the temporary MPT artifact file');
+      });
     }
+  }
+
+  /**
+   * Stream the response body to a temporary file.
+   *
+   * A rendered Short is tens of megabytes and the previous implementation
+   * buffered the whole body with arrayBuffer() before writing, which held two
+   * copies in memory at once. Streaming keeps peak memory flat regardless of
+   * artifact size; the caller still renames atomically, so a partial download
+   * is never visible at the final path.
+   */
+  async _streamToFile(response, temporary) {
+    const handle = await fsp.open(temporary, 'wx');
+    let written = 0;
+    try {
+      if (response.body && typeof response.body[Symbol.asyncIterator] === 'function') {
+        for await (const chunk of response.body) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          if (buffer.length) {
+            await handle.write(buffer);
+            written += buffer.length;
+          }
+        }
+      } else {
+        // Test doubles and runtimes without an async-iterable body.
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (buffer.length) {
+          await handle.write(buffer);
+          written = buffer.length;
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+    return written;
   }
 
   async _secureDestination(destination) {

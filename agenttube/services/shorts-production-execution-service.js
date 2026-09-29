@@ -13,6 +13,12 @@ const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
 // instead of resubmitting work forever.
 const MAX_LOST_TASK_RECOVERIES = 3;
 
+// Largest acceptable gap between the rendered video track and its narration
+// track. Encoders legitimately pad the final audio frame, so a small gap is
+// normal; anything larger means narration was cut off or the video runs on
+// past the voiceover.
+const AV_DURATION_TOLERANCE_SECONDS = 2;
+
 class ShortsProductionExecutionError extends Error {
   constructor(message, code = 'PRODUCTION_EXECUTION_FAILED', details = null) {
     super(message);
@@ -400,6 +406,21 @@ async function validateVideoArtifact(filePath, approvedDuration, options = {}) {
       if (duration < 60 || duration > 120) failures.push('Artifact duration is outside the YouTube Shorts production range of 60–120 seconds');
       if (Math.abs(duration - Number(approvedDuration)) > 3) failures.push('Artifact duration differs from the approved duration by more than 3 seconds');
     }
+
+    // The container duration alone does not prove the narration survived.
+    // A muxing or concat mistake can leave a full-length video track over a
+    // truncated audio track, which renders as a Short that goes silent
+    // part-way through and still passes every other check here.
+    const audioDuration = Number(probe.audio?.duration);
+    const videoDuration = Number(probe.video?.duration);
+    if (Number.isFinite(audioDuration) && audioDuration > 0 && Number.isFinite(videoDuration) && videoDuration > 0) {
+      if (Math.abs(audioDuration - videoDuration) > AV_DURATION_TOLERANCE_SECONDS) {
+        failures.push(
+          `Audio and video durations diverge by more than ${AV_DURATION_TOLERANCE_SECONDS} seconds ` +
+          `(video ${videoDuration.toFixed(2)}s, audio ${audioDuration.toFixed(2)}s)`
+        );
+      }
+    }
   }
   if (!failures.length) {
     try { await (options.decode || decodeVideoArtifact)(filePath); }
@@ -418,11 +439,14 @@ async function validateVideoArtifact(filePath, approvedDuration, options = {}) {
     file_size: stat?.size || 0,
     sha256,
     duration_seconds: probe?.duration || null,
+    video_duration_seconds: Number.isFinite(Number(probe?.video?.duration)) ? Number(probe.video.duration) : null,
+    audio_duration_seconds: Number.isFinite(Number(probe?.audio?.duration)) ? Number(probe.audio.duration) : null,
     resolution: probe?.video ? `${probe.video.width}x${probe.video.height}` : null,
     video_codec: probe?.video?.codec || null,
     audio_codec: probe?.audio?.codec || null,
     container: probe?.container || null,
-    duration_tolerance_seconds: 3
+    duration_tolerance_seconds: 3,
+    av_duration_tolerance_seconds: AV_DURATION_TOLERANCE_SECONDS
   };
   if (failures.length) {
     const error = new Error(failures.join('; '));
@@ -441,8 +465,17 @@ async function probeVideoArtifact(filePath) {
     return {
       container: data.format?.format_name,
       duration: Number(data.format?.duration || video?.duration),
-      video: video ? { codec: video.codec_name, width: Number(video.width), height: Number(video.height) } : null,
-      audio: audio ? { codec: audio.codec_name } : null
+      video: video
+        ? {
+          codec: video.codec_name,
+          width: Number(video.width),
+          height: Number(video.height),
+          duration: Number(video.duration ?? data.format?.duration)
+        }
+        : null,
+      // Per-stream durations let the validator prove the narration is as long
+      // as the picture; the container duration only reports the longer of them.
+      audio: audio ? { codec: audio.codec_name, duration: Number(audio.duration) } : null
     };
   } catch (_error) {
     try { await runFFmpeg(['-i', filePath]); } catch (error) {

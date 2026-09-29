@@ -298,6 +298,72 @@ test('failed production retries the same job and submits a fresh MPT task', asyn
   assert.equal(h.database.jobs.size, 1);
 });
 
+test('truncated narration is rejected even when the container duration looks right', async t => {
+  // A concat or mux mistake can leave a full-length video track over a short
+  // audio track. The container reports the longer stream, so without a
+  // per-stream check this renders as a Short that goes silent part-way.
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'av-drift-'));
+  const file = path.join(directory, 'video.mp4');
+  await fs.writeFile(file, Buffer.from('fixture'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+
+  await assert.rejects(validateVideoArtifact(file, 70, {
+    probe: async () => ({
+      container: 'mov,mp4',
+      duration: 70,
+      video: { codec: 'h264', width: 1080, height: 1920, duration: 70 },
+      audio: { codec: 'aac', duration: 41.2 }
+    }),
+    decode: async () => {}
+  }), error => {
+    assert.match(error.message, /Audio and video durations diverge/);
+    assert.equal(error.validation.audio_duration_seconds, 41.2);
+    assert.equal(error.validation.video_duration_seconds, 70);
+    return true;
+  });
+});
+
+test('a small encoder-padding gap between streams is accepted', async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'av-ok-'));
+  const file = path.join(directory, 'video.mp4');
+  await fs.writeFile(file, Buffer.from('fixture'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+
+  const result = await validateVideoArtifact(file, 70, {
+    probe: async () => ({
+      container: 'mov,mp4',
+      duration: 70.1,
+      video: { codec: 'h264', width: 1080, height: 1920, duration: 70.1 },
+      audio: { codec: 'aac', duration: 69.4 }
+    }),
+    decode: async () => {}
+  });
+  assert.equal(result.passed, true);
+  assert.equal(result.av_duration_tolerance_seconds, 2);
+});
+
+test('per-stream durations are optional and never fabricated', async t => {
+  // The FFmpeg-metadata fallback cannot report per-stream durations; their
+  // absence must not turn into a false failure or an invented number.
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'av-absent-'));
+  const file = path.join(directory, 'video.mp4');
+  await fs.writeFile(file, Buffer.from('fixture'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+
+  const result = await validateVideoArtifact(file, 70, {
+    probe: async () => ({
+      container: 'mov,mp4',
+      duration: 70,
+      video: { codec: 'h264', width: 1080, height: 1920 },
+      audio: { codec: 'aac' }
+    }),
+    decode: async () => {}
+  });
+  assert.equal(result.passed, true);
+  assert.equal(result.audio_duration_seconds, null);
+  assert.equal(result.video_duration_seconds, null);
+});
+
 test('cancelled and timed-out productions are retryable without creating a second job', async () => {
   for (const status of ['CANCELLED', 'TIMEOUT']) {
     const h = harness();

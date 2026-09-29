@@ -125,6 +125,46 @@ test('artifact download is non-empty and stays inside configured directory', asy
   await fs.rm(root, { recursive: true });
 });
 
+test('artifacts stream to disk chunk by chunk instead of buffering', async () => {
+  // A rendered Short is tens of megabytes; the body must never be materialised
+  // whole in memory. A body that only supports async iteration proves the
+  // streaming path is used rather than arrayBuffer().
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mpt-stream-'));
+  const chunks = ['chunk-a', 'chunk-b', 'chunk-c'];
+  const client = clientWith(async () => ({
+    ok: true,
+    status: 200,
+    body: (async function* stream() {
+      for (const chunk of chunks) yield Buffer.from(chunk);
+    })(),
+    arrayBuffer: async () => { throw new Error('arrayBuffer must not be used for artifacts'); }
+  }), { artifactDir: root });
+
+  const artifact = await client.download_artifact('/tasks/task/final.mp4', 'job/final.mp4');
+  assert.equal(await fs.readFile(artifact.path, 'utf8'), chunks.join(''));
+  assert.equal(artifact.size, chunks.join('').length);
+  await fs.rm(root, { recursive: true });
+});
+
+test('an interrupted artifact stream leaves no file at the final path', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mpt-partial-'));
+  const client = clientWith(async () => ({
+    ok: true,
+    status: 200,
+    body: (async function* stream() {
+      yield Buffer.from('first-part');
+      throw new Error('connection reset');
+    })()
+  }), { artifactDir: root });
+
+  await assert.rejects(client.download_artifact('/tasks/task/final.mp4', 'job/final.mp4'));
+  // Neither the destination nor a leftover .part file may remain.
+  await assert.rejects(fs.stat(path.join(root, 'job', 'final.mp4')), error => error.code === 'ENOENT');
+  const leftovers = await fs.readdir(path.join(root, 'job')).catch(() => []);
+  assert.deepEqual(leftovers, []);
+  await fs.rm(root, { recursive: true });
+});
+
 test('artifact path traversal is rejected', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mpt-artifacts-'));
   await assert.rejects(clientWith(async () => response(200, Buffer.from('x'), true), { artifactDir: root }).download_artifact('/tasks/a.mp4', '../escape.mp4'), error => error.code === 'UNSAFE_ARTIFACT_PATH');
