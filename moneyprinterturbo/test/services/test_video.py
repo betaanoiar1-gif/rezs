@@ -799,6 +799,62 @@ class TestVideoService(unittest.TestCase):
                 "C:/Users/Test User'\\''s Videos/clip.mp4",
             )
 
+    def test_concat_video_clips_uses_stream_copy_when_compatible(self):
+        """Compatible normalized clips should concatenate without re-encoding."""
+        def fake_run(command, capture_output, text, check, **kwargs):
+            self.assertNotIn("-c:v", command)
+            self.assertIn("-c", command)
+            self.assertEqual(command[command.index("-c") + 1], "copy")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=[clip_file],
+                    output_file=output_file,
+                    threads=1,
+                    output_dir=temp_dir,
+                    max_duration=12.345,
+                )
+
+        self.assertEqual(run.call_count, 1)
+        command = run.call_args.args[0]
+        self.assertIn(["-t", "12.345"], [command[i:i+2] for i in range(len(command)-1)])
+
+    def test_concat_video_clips_falls_back_to_encoder_when_stream_copy_fails(self):
+        """Incompatible inputs should fall back from stream copy to the encoder."""
+        config.app["video_codec"] = "libx264"
+
+        def fake_run(command, capture_output, text, check, **kwargs):
+            if "-c:v" not in command:
+                return types.SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="stream copy incompatible",
+                )
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=[clip_file],
+                    output_file=output_file,
+                    threads=1,
+                    output_dir=temp_dir,
+                )
+
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("-c:v", run.call_args_list[0].args[0])
+        self.assertIn("-c:v", run.call_args_list[1].args[0])
+
     def test_concat_video_clips_falls_back_after_runtime_encoder_failure(self):
         """
         最终 ffmpeg concat 阶段也要具备同样的回退能力。这里用 mock 模拟
@@ -807,6 +863,12 @@ class TestVideoService(unittest.TestCase):
         config.app["video_codec"] = "h264_nvenc"
 
         def fake_run(command, capture_output, text, check, **kwargs):
+            if "-c:v" not in command:
+                return types.SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="stream copy incompatible",
+                )
             codec_index = command.index("-c:v") + 1
             codec = command[codec_index]
             if codec == "h264_nvenc":
@@ -846,6 +908,12 @@ class TestVideoService(unittest.TestCase):
         config.app["video_codec"] = "h264_nvenc"
 
         def fake_run(command, capture_output, text, check, **kwargs):
+            if "-c:v" not in command:
+                return types.SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="stream copy incompatible",
+                )
             codec_index = command.index("-c:v") + 1
             codec = command[codec_index]
             return types.SimpleNamespace(
