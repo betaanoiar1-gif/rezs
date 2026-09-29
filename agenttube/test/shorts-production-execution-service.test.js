@@ -176,6 +176,53 @@ test('bounded polling timeout remains TIMEOUT', async () => {
   assert.equal((await h.database.getProductionJob(job.job_id)).status, 'TIMEOUT');
 });
 
+test('failed production retries the same job and submits a fresh MPT task', async () => {
+  const h = harness();
+  const first = await h.service.start('short_prep_test');
+  await h.database.updateProductionJob(first.job_id, {
+    status: 'FAILED',
+    stage: 'MPT_FAILED',
+    mpt_task_id: 'mpt-task-failed',
+    artifact_reference: '/api/v1/download/mpt-task-failed/final.mp4',
+    artifact_path: '/safe/failed.mp4',
+    validation_result: { passed: false },
+    last_error: 'previous render failed',
+    completed_at: '2026-09-28T00:00:00.000Z'
+  });
+
+  const retried = await h.service.start('short_prep_test');
+
+  assert.equal(retried.job_id, first.job_id);
+  assert.equal(retried.status, 'RUNNING');
+  assert.equal(retried.stage, 'RENDERING');
+  assert.equal(retried.mpt_task_id, 'mpt-task-1');
+  assert.equal(retried.retried, true);
+  assert.equal(retried.retry_count, 1);
+  assert.equal(h.submissions(), 2);
+  assert.equal(retried.last_error, null);
+  assert.equal(retried.artifact_reference, null);
+  assert.equal(retried.artifact_path, null);
+  assert.equal(retried.validation_result, null);
+  assert.equal(retried.completed_at, null);
+  assert.equal(h.database.jobs.size, 1);
+});
+
+test('cancelled and timed-out productions are retryable without creating a second job', async () => {
+  for (const status of ['CANCELLED', 'TIMEOUT']) {
+    const h = harness();
+    const first = await h.service.start('short_prep_test');
+    await h.database.updateProductionJob(first.job_id, { status, stage: status, mpt_task_id: 'old-task' });
+
+    const retried = await h.service.start('short_prep_test');
+
+    assert.equal(retried.job_id, first.job_id);
+    assert.equal(retried.status, 'RUNNING');
+    assert.equal(retried.retried, true);
+    assert.equal(h.submissions(), 2);
+    assert.equal(h.database.jobs.size, 1);
+  }
+});
+
 test('existing production reuses one job and never submits a second MPT task', async () => {
   const h = harness();
   const first = await h.service.start('short_prep_test');
