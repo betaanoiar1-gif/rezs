@@ -122,6 +122,39 @@ and git already use — not a bypass.
 produce a live run while egress is blocked, which is why the harness probes
 reachability even when a key is absent.
 
+### 2.5 Whether the platform exposes controls for either
+
+Checked against Arena's own documentation rather than assumed. The help centre
+holds 34 articles across four collections (How To 18, Troubleshooting 10,
+Policies 5, Experiments 1). None concerns secrets, environment variables, or
+network configuration.
+
+"How to use coding in Agent Mode" enumerates the whole coding feature set —
+connect GitHub, work in a sandbox copy of the repository, review a diff, drive
+the git workflow, request a preview, watch the Checks window, one pull request
+per session. The settings control it describes manages repositories and the
+GitHub connection, nothing else. "How to use Agent Mode" lists the tools as web
+search, image generation, file upload, coding assistance and a sandbox/bash
+environment.
+
+**Conclusion: Arena currently exposes no user-facing mechanism to set custom
+sandbox environment variables, and none to modify the egress allowlist.** The
+platform clearly has the capability — `GH_TOKEN` is injected for the GitHub
+integration, and the allowlist already admits `registry.npmjs.org`, `pypi.org`
+and `github.com` — but it is not surfaced as a user setting, and it cannot be
+reached from inside the sandbox.
+
+This is worth stating plainly because comparable platforms do document these
+controls: Codex exposes a `domains` allowlist and setup-scoped secrets, Claude
+Code exposes `sandbox.network.allowedDomains` and `sandbox.credentials.envVars`,
+and Google's Agent Platform exposes a domain allowlist. Arena documents neither,
+so this is a platform gap to raise with Arena support, not a configuration step
+that was missed.
+
+No workaround was attempted. Building an egress proxy or relaying the provider
+APIs through a permitted host would defeat a deliberate security control and
+would change the architecture, so the status stays `UNREACHABLE`.
+
 ---
 
 ## 3. What was validated live
