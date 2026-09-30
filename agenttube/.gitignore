@@ -95,3 +95,5 @@ data/e2e-full-pipeline.json
 
 # Claude worktrees
 .claude/worktrees/
+data/live-validation/
+data/live-validation.json
