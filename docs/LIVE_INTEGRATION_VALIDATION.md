@@ -37,44 +37,90 @@ Machine-readable: `agenttube/data/live-validation.json`.
 
 ---
 
-## 2. The two blockers
+## 2. Environment assessment
 
-### Blocker A — no credentials are present
+### 2.1 Secrets mechanism available in Arena
 
-No provider credential exists in this environment. Checked by name, never by
-value:
+The runtime is an **E2B sandbox** (`/run/e2b`, `E2B_SANDBOX_ID`). Its entire
+environment is 16 variables. There is **no secrets mount** — `/run/secrets`,
+`/var/run/secrets`, `/etc/secrets`, `/vault`, `~/.secrets` and
+`~/.config/secrets` are all absent, `/etc/environment` is empty (0 bytes), and
+no metadata service listens locally.
 
-```
-CLEANAPIS_API_KEY    NOT SET
-CLEANAPIS_MODEL      NOT SET
-PIXABAY_API_KEY      NOT SET
-PEXELS_API_KEY       NOT SET
-COVERR_API_KEY       NOT SET
-```
+What does exist is proof that the platform can inject environment variables:
+`GH_TOKEN` and `GITHUB_TOKEN` are present in the sandbox and were placed there
+by Arena, not by this repository.
 
-There is no `.env` file, and no secret-management mount is present. The only
-credentials in the environment are `GH_TOKEN` / `GITHUB_TOKEN`, used for git.
+**So the mechanism is environment-variable injection at sandbox creation.**
+It must be configured from the Arena side — it cannot be created, enumerated
+or written from inside the sandbox, and nothing in this repository can grant
+itself a credential. No `.env` file exists, and `.env` is gitignored
+(`agenttube/.gitignore:8`), so a committed secret is not possible through the
+normal path.
 
-### Blocker B — provider egress is blocked
+### 2.2 How the project consumes secrets without leaking them
 
-Reachability was probed at three layers to avoid blaming the wrong thing:
+Already implemented; nothing further is required:
 
-| Host | DNS | TCP :443 | TLS | Verdict |
-| --- | --- | --- | --- | --- |
-| `www.cleanapis.com` | resolves | connects | **ECONNRESET** | blocked |
-| `pixabay.com` | resolves | connects | **ECONNRESET** | blocked |
-| `api.pexels.com` | resolves | connects | **ECONNRESET** | blocked |
-| `api.coverr.co` | resolves | connects | **ECONNRESET** | blocked |
-| `registry.npmjs.org` | resolves | connects | succeeds | **reachable** |
+- Every entry point calls `dotenv`, then reads `process.env.<NAME>` only.
+  The six names are `CLEANAPIS_API_KEY`, `CLEANAPIS_MODEL`,
+  `CLEANAPIS_BASE_URL`, `PIXABAY_API_KEY`, `PEXELS_API_KEY`, `COVERR_API_KEY`.
+- No code path logs a credential value. The only `process.env` value reaching
+  a log is `MPT_BASE_URL`, a local address.
+- Provider errors carry `{ provider, status }`, never the request URL or
+  headers, so a Pixabay key in a query string cannot reach a message.
+- The validation harness reports credentials as `set (N characters)` or
+  `NOT SET`, never the value, and passes anything that could contain a key
+  through `redact()`. Covered by `test/live-validation-redaction.test.js`.
 
-DNS resolves and TCP completes, then the TLS handshake is reset. That is the
-signature of an egress allowlist terminating the connection, not a provider
-outage or a bad key. `registry.npmjs.org` succeeding through the same stack
-proves the network path itself is healthy.
+### 2.3 Egress status
 
-**Both blockers are independent.** Supplying credentials alone would not
-produce a live run while egress is blocked, which is exactly why the harness
-probes reachability even when a key is absent.
+Probed at DNS, TCP and TLS, then **re-probed with the system CA bundle** to
+separate a trust problem from a blocked route:
+
+| Host | Role | DNS | TCP :443 | TLS | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| `www.cleanapis.com` | Clean APIs | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `pixabay.com` | Pixabay API + media | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `cdn.pixabay.com` | Pixabay media CDN | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `api.pexels.com` | Pexels API | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `videos.pexels.com` | Pexels media CDN | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `player.vimeo.com` | Pexels media fallback | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `api.coverr.co` | Coverr API | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `storage.coverr.co` | Coverr media CDN | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `cdn.coverr.co` | Coverr media CDN | resolves | connects | `ECONNRESET` | **BLOCKED** |
+| `registry.npmjs.org` | control | resolves | connects | OK, issuer *Google Trust Services* | reachable, passthrough |
+| `github.com` | control | resolves | connects | OK, issuer **E2B** | reachable, **TLS-intercepted** |
+
+Egress leaves through an E2B proxy that behaves three different ways, and the
+difference matters:
+
+1. **Passthrough** — `registry.npmjs.org` presents its real certificate.
+2. **Intercepted** — `github.com` presents a certificate issued by
+   `O = E2B, CN = E2B Proxy CA`, which is present in the system CA bundle
+   (`/etc/ssl/certs/ca-certificates.crt`, 143 certs) but **not** in Node's
+   built-in store. Node therefore fails such a host with
+   `UNABLE_TO_VERIFY_LEAF_SIGNATURE` until it is told to trust the system
+   bundle.
+3. **Blocked** — all nine provider hosts are reset at the TLS handshake.
+
+The reset persists with the system CA bundle loaded, which rules out a
+certificate problem: these hosts are **not on the egress allowlist**. This is
+an environment restriction, not a provider outage and not a rejected key. No
+attempt was made to work around it.
+
+### 2.4 Consequence for the live run
+
+`NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt` will very likely be
+required once the providers are allowlisted, because an allowlisted host is
+served through the intercepting proxy, exactly like `github.com`. Without it,
+every provider call fails with a certificate error that looks like a provider
+fault. This is ordinary configuration — pointing Node at the trust store curl
+and git already use — not a bypass.
+
+**The two blockers are independent.** Supplying credentials alone will not
+produce a live run while egress is blocked, which is why the harness probes
+reachability even when a key is absent.
 
 ---
 
@@ -174,24 +220,70 @@ unredacted URL in a report would publish the credential.
 
 ## 8. To complete this validation
 
-Two things are required, and the second is the one usually forgotten:
+### 8.1 Variables to set in Arena (names only — never paste values into chat, source or Git)
 
-1. **Provide the credentials** as environment variables — `CLEANAPIS_API_KEY`,
-   `CLEANAPIS_MODEL` (Clean APIs publishes no model list, so it must be named),
-   `PIXABAY_API_KEY`, `PEXELS_API_KEY`, `COVERR_API_KEY`.
-2. **Allow egress** to `www.cleanapis.com`, `pixabay.com`, `api.pexels.com`,
-   `api.coverr.co`, plus the CDN hosts the providers redirect downloads to.
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `CLEANAPIS_API_KEY` | yes | Clean APIs authentication |
+| `CLEANAPIS_MODEL` | **yes** | Clean APIs publishes no model list, so the service refuses to guess one |
+| `PIXABAY_API_KEY` | yes | Pixabay authentication |
+| `PEXELS_API_KEY` | yes | Pexels authentication |
+| `COVERR_API_KEY` | yes | Coverr authentication |
+| `CLEANAPIS_BASE_URL` | optional | Only to override the default endpoint |
 
-Then:
+They must arrive as process environment variables in the sandbox, the same way
+`GH_TOKEN` already does. No repository change is needed to consume them.
+
+### 8.2 Domains to allowlist for egress
+
+API hosts alone are not enough: search would succeed and every download would
+fail. The media CDNs are required, and this list is taken from the host
+allowlist the code itself enforces in `integrations/stock-media.js`.
+
+| Provider | API host | Download hosts |
+| --- | --- | --- |
+| Clean APIs | `www.cleanapis.com` | — |
+| Pixabay | `pixabay.com` | `cdn.pixabay.com` |
+| Pexels | `api.pexels.com` | `videos.pexels.com`, `player.vimeo.com` |
+| Coverr | `api.coverr.co` | `storage.coverr.co`, `cdn.coverr.co`, `coverr.co` |
+
+### 8.3 Final commands
+
+Per-component live validation:
 
 ```bash
 cd agenttube
-node scripts/live-integration-validation.js          # per-component live table
-node scripts/e2e-full-pipeline.js "your topic"       # no substitution flags
+NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+FFMPEG_PATH=/home/user/.local/bin/ffmpeg \
+FFPROBE_PATH=/home/user/.local/bin/ffprobe \
+MPT_BASE_URL=http://127.0.0.1:8080 \
+node scripts/live-integration-validation.js
 ```
 
-The harness exits non-zero unless every component is `PASS`, so it is safe to
-gate on.
+Full live end-to-end, with no substitution flags set:
+
+```bash
+cd agenttube
+NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+FFMPEG_PATH=/home/user/.local/bin/ffmpeg \
+FFPROBE_PATH=/home/user/.local/bin/ffprobe \
+MPT_BASE_URL=http://127.0.0.1:8080 \
+MPT_VOICE_NAME="local_espeak:en-us" \
+MPT_POLL_INTERVAL_MS=3000 MPT_MAX_POLLS=600 \
+node scripts/e2e-full-pipeline.js "why cold water swimming improves focus"
+```
+
+MoneyPrinterTurbo must be running first:
+
+```bash
+cd moneyprinterturbo && PATH="$HOME/.local/bin:$PATH" .venv/bin/python main.py
+```
+
+Omitting `REZS_E2E_LOCAL_AI` and `REZS_E2E_SEED_MATERIALS` is what makes the
+E2E fully live; with providers configured it uses them automatically. The
+validation harness exits non-zero unless every component is `PASS`, so it is
+safe to gate on. Neither `NO_CREDENTIAL` nor `UNREACHABLE` is treated as
+success.
 
 ---
 
