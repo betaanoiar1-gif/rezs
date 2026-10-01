@@ -2,6 +2,7 @@
 require('dotenv').config();
 
 const { spawn } = require('child_process');
+const path = require('path');
 
 const BASE_URL = process.env.REZS_BASE_URL || `http://127.0.0.1:${process.env.PORT || 3000}`;
 const API_KEY = process.env.API_KEY || '';
@@ -90,7 +91,7 @@ async function ensureServer() {
     console.log('▶ Starting AgentTube server...');
 
     const child = spawn(process.execPath, ['index.js'], {
-      cwd: process.cwd(),
+      cwd: path.resolve(__dirname, '..'),
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe']
     });
