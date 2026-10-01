@@ -9,7 +9,7 @@ const BASE_URL = process.env.REZS_BASE_URL || `http://127.0.0.1:${AGENTTUBE_PORT
 const API_KEY = process.env.API_KEY || '';
 const TOPIC = process.argv.slice(2).join(' ').trim();
 
-const REQUEST_TIMEOUT_MS = Number(process.env.REZS_REQUEST_TIMEOUT_MS || 120000);
+const REQUEST_TIMEOUT_MS = Number(process.env.REZS_REQUEST_TIMEOUT_MS || 300000);
 const POLL_INTERVAL_MS = Number(process.env.REZS_POLL_INTERVAL_MS || 5000);
 const FACTORY_TIMEOUT_MS = Number(process.env.REZS_FACTORY_TIMEOUT_MS || 15 * 60 * 1000);
 
