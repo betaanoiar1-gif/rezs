@@ -4,7 +4,8 @@ require('dotenv').config();
 const { spawn } = require('child_process');
 const path = require('path');
 
-const BASE_URL = process.env.REZS_BASE_URL || `http://127.0.0.1:${process.env.PORT || 3000}`;
+const AGENTTUBE_PORT = process.env.REZS_PORT || process.env.PORT || 3456;
+const BASE_URL = process.env.REZS_BASE_URL || `http://127.0.0.1:${AGENTTUBE_PORT}`;
 const API_KEY = process.env.API_KEY || '';
 const TOPIC = process.argv.slice(2).join(' ').trim();
 
