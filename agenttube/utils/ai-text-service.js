@@ -17,6 +17,14 @@ const PROVIDERS = {
     envKey: 'CLEANAPIS_API_KEY',
     modelEnvKey: 'CLEANAPIS_MODEL',
   },
+  kiosapi: {
+    name: 'KiosAPI',
+    baseURL: 'https://kiosapi.com/v1',
+    defaultModel: 'deepseek-v4-flash-free',
+    models: ['deepseek-v4-flash-free'],
+    envKey: 'KIOSAPI_API_KEY',
+    modelEnvKey: 'KIOSAPI_MODEL',
+  },
   openai: {
     name: 'OpenAI',
     baseURL: 'https://api.openai.com/v1',
