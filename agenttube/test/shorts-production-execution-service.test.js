@@ -50,7 +50,11 @@ function harness({ prep = preparation(), submitError, pollResult, pollError, val
       return database.updateProductionJob(id, { status: 'RUNNING', stage: 'RENDERING', mpt_task_id: 'mpt-task-1' });
     },
     poll: async id => {
-      if (pollError) throw pollError;
+      if (pollError) {
+        const error = pollError;
+        pollError = null;
+        throw error;
+      }
       const result = pollResult || { status: 'SUCCEEDED', stage: 'RENDERED' };
       return database.updateProductionJob(id, result);
     },
