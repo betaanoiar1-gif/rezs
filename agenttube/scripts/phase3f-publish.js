@@ -92,7 +92,7 @@ async function main() {
       return;
     }
 
-    const published = await publishing.publishContent(productionJobId, { publishNow: false });
+    const published = await publishing.publishContent(productionJobId, { publishNow: true });
     console.log(JSON.stringify({
       status: published.status,
       youtubeId: published.youtubeId,
