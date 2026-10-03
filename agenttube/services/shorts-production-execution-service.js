@@ -4,6 +4,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService } = require('../integrations/moneyprinterturbo');
 const { getFFprobePath, runFFmpeg } = require('../utils/ffmpeg');
+const { recordAIArtifact } = require('./ai-company-adapter');
 
 const execFileAsync = promisify(execFile);
 const TERMINAL = new Set(['SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMEOUT']);
@@ -315,10 +316,27 @@ class ShortsProductionExecutionService {
       throw new ShortsProductionExecutionError(message, 'ARTIFACT_VALIDATION_FAILED', { production_job_id: productionJobId, validation: result });
     }
 
-    return this.database.updateProductionJob(productionJobId, {
+    const completed = await this.database.updateProductionJob(productionJobId, {
       status: 'SUCCEEDED', stage: 'ARTIFACT_DOWNLOADED', last_error: null,
       validation_result: validation, completed_at: new Date().toISOString()
     });
+    await recordAIArtifact({
+      database: this.database,
+      artifactId: `timeline_${productionJobId}`,
+      artifactType: 'timeline',
+      producer: { agent_id: 'editor-agent', layer: 'production' },
+      payload: {
+        production_job_id: productionJobId,
+        preparation_id: job.preparation_id,
+        planning_job_id: job.planning_job_id,
+        status: completed.status,
+        stage: completed.stage,
+        artifact_path: completed.artifact_path,
+        validation_result: validation,
+        completed_at: completed.completed_at
+      }
+    });
+    return completed;
   }
 
   async get(productionJobId) {
