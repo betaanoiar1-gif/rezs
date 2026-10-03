@@ -27,6 +27,8 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { AICompanyFoundationService } = require('./services/ai-company-foundation-service');
+const { registerAll: registerAICompanyAgents } = require('./config/ai-company-agent-registry');
 const { ShortsPlanningService, PlanningError } = require('./services/shorts-planning-service');
 const { ShortsProductionPreparationService, ProductionPreparationError } = require('./services/shorts-production-preparation-service');
 const { ShortsProductionExecutionService, ShortsProductionExecutionError } = require('./services/shorts-production-execution-service');
@@ -57,6 +59,7 @@ class YouTubeAutomationAgent {
     this.engagement = null;
     this.experiments = null;
     this.discoverability = null;
+    this.aiCompany = null;
     this.setupRequired = false;
   }
 
@@ -70,6 +73,13 @@ class YouTubeAutomationAgent {
       this.db = new Database();
       await this.db.initialize();
       await this.db.markInterruptedJobs();
+
+      // Foundation is metadata/orchestration state only. It does not alter
+      // MPT, TTS, scene fetching, rendering, validation, or publishing behavior.
+      this.aiCompany = new AICompanyFoundationService(this.db, { logger: this.logger });
+      await this.aiCompany.initialize();
+      await registerAICompanyAgents(this.aiCompany);
+
       this.recovery = new GenerationRecoveryService(this.db, {
         logger: this.logger,
         updateJobStage: (...args) => this.updateJobStage(...args)
