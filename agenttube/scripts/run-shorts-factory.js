@@ -76,6 +76,7 @@ async function waitForServer() {
       await request('/api/dashboard', {}, 3000);
       return;
     } catch {
+      // Server is not ready yet; retry until the deadline.
       await sleep(1000);
     }
   }
@@ -89,6 +90,7 @@ async function ensureServer() {
     console.log(`✓ AgentTube already running: ${BASE_URL}`);
     return null;
   } catch {
+    // A failed health check means the helper should start a local server.
     console.log('▶ Starting AgentTube server...');
 
     const child = spawn(process.execPath, ['index.js'], {
@@ -269,7 +271,7 @@ async function main() {
             prep?.preparation?.production_job_id ||
             prep?.preparation?.job_id ||
             null;
-        } catch {}
+        } catch { /* production job may appear asynchronously */ }
       }
     }
 
@@ -357,7 +359,7 @@ async function main() {
     if (serverProcess) {
       try {
         serverProcess.kill('SIGTERM');
-      } catch {}
+      } catch { /* shutdown is best-effort */ }
     }
   }
 }
