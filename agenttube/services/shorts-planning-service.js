@@ -4,6 +4,8 @@ const { ContentStrategyAgent } = require('../agents/content-strategy-agent');
 const { ScriptWriterAgent } = require('../agents/script-writer-agent');
 const { SEOOptimizerAgent } = require('../agents/seo-optimizer-agent');
 const { createArtifact } = require('../schemas/ai-company-artifacts');
+const { AICompanyFoundationService } = require('./ai-company-foundation-service');
+const { registerAll: registerAICompanyAgents } = require('../config/ai-company-agent-registry');
 
 const STATUSES = new Set(['PENDING', 'RUNNING', 'SUCCEEDED', 'BLOCKED', 'FAILED']);
 
@@ -26,6 +28,7 @@ class ShortsPlanningService {
     this.researchProvider = researchProvider;
     this.foundation = foundation;
     this.logger = logger || new Logger('ShortsPlanning');
+    this.foundationPromise = null;
   }
 
   providerStatus() {
@@ -108,19 +111,20 @@ class ShortsPlanningService {
 
       // AI Company Foundation observes the existing planning artifact only.
       // It does not alter strategy, script, narration, scenes, or SEO generation.
-      if (this.foundation) {
-        const runId = await this.foundation.startRun({
+      const foundation = await this._getFoundation();
+      if (foundation) {
+        const runId = await foundation.startRun({
           runType: 'shorts_planning',
           context: { planning_job_id: jobId, topic: normalizedTopic }
         });
-        await this.foundation.saveArtifact(createArtifact({
+        await foundation.saveArtifact(createArtifact({
           artifactId: `research_${jobId}`,
           artifactType: 'research',
           producer: { agent_id: 'topic-research', layer: 'intelligence' },
           runId,
           payload: research
         }));
-        await this.foundation.saveArtifact(createArtifact({
+        await foundation.saveArtifact(createArtifact({
           artifactId: `strategy_${jobId}`,
           artifactType: 'strategy',
           producer: { agent_id: 'content-strategist', layer: 'strategy' },
@@ -128,7 +132,7 @@ class ShortsPlanningService {
           parentArtifactIds: [`research_${jobId}`],
           payload: { angle: strategy.angle, targetAudience: strategy.targetAudience, contentType: strategy.contentType, keywords: strategy.keywords || [] }
         }));
-        await this.foundation.saveArtifact(createArtifact({
+        await foundation.saveArtifact(createArtifact({
           artifactId: `story_${jobId}`,
           artifactType: 'story',
           producer: { agent_id: 'story-architect', layer: 'creative' },
@@ -136,7 +140,7 @@ class ShortsPlanningService {
           parentArtifactIds: [`strategy_${jobId}`],
           payload: { hook: artifact.hook, script: artifact.script }
         }));
-        await this.foundation.saveArtifact(createArtifact({
+        await foundation.saveArtifact(createArtifact({
           artifactId: `creative_plan_${jobId}`,
           artifactType: 'creative_plan',
           producer: { agent_id: 'creative-director', layer: 'creative' },
@@ -144,7 +148,7 @@ class ShortsPlanningService {
           parentArtifactIds: [`story_${jobId}`],
           payload: { scenes: artifact.scenes, metadata: artifact.metadata, estimated_duration_seconds: artifact.estimated_duration_seconds }
         }));
-        await this.foundation.saveArtifact(createArtifact({
+        await foundation.saveArtifact(createArtifact({
           artifactId: `production_manifest_${jobId}`,
           artifactType: 'production_manifest',
           producer: { agent_id: 'production-agent', layer: 'production' },
@@ -152,7 +156,7 @@ class ShortsPlanningService {
           parentArtifactIds: [`creative_plan_${jobId}`],
           payload: { topic: artifact.topic, target_duration_seconds: artifact.estimated_duration_seconds, aspect_ratio: '9:16', factory: 'existing-mpt-pipeline' }
         }));
-        await this.foundation.finishRun(runId, { status: 'succeeded' });
+        await foundation.finishRun(runId, { status: 'succeeded' });
       }
 
       await this.database.updateShortsPlanningJob(jobId, { status: 'SUCCEEDED', stage: 'PLANNED', artifact, error_code: null, error_message: null });
@@ -163,6 +167,19 @@ class ShortsPlanningService {
       normalized.details = { ...(normalized.details || {}), job_id: jobId };
       throw normalized;
     }
+  }
+
+  async _getFoundation() {
+    if (this.foundation) return this.foundation;
+    if (!this.foundationPromise) {
+      this.foundationPromise = (async () => {
+        const service = new AICompanyFoundationService(this.database, { logger: this.logger });
+        await service.initialize();
+        await registerAICompanyAgents(service);
+        return service;
+      })();
+    }
+    return await this.foundationPromise;
   }
 
   async _research(topic) {
