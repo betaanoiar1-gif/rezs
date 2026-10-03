@@ -1,6 +1,7 @@
 const fsp = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
+const { URLSearchParams } = require('url');
 
 const API_BASE = 'https://pixabay.com/api/videos/';
 
@@ -38,7 +39,7 @@ class PixabayVideoClient {
     try {
       const cached = JSON.parse(await fsp.readFile(cachePath, 'utf8'));
       if (cached && Number(cached.cached_at) + this.searchCacheTtlMs > Date.now() && Array.isArray(cached.hits)) return cached.hits;
-    } catch {}
+    } catch { /* cache miss is expected */ }
     const response = await this.fetch(`${API_BASE}?${params}`);
     if (!response.ok) throw new PixabayError(`Pixabay search failed with HTTP ${response.status}`, 'PIXABAY_HTTP_ERROR', { status: response.status });
     const data = await response.json();
@@ -66,7 +67,7 @@ class PixabayVideoClient {
     try {
       const stat = await fsp.stat(target);
       if (stat.isFile() && stat.size > 0) return provenance(hit, variant, target);
-    } catch {}
+    } catch { /* existing target is not present */ }
     const response = await this.fetch(sourceUrl);
     if (!response.ok) throw new PixabayError(`Pixabay download failed with HTTP ${response.status}`, 'PIXABAY_DOWNLOAD_FAILED', { status: response.status });
     const bytes = Buffer.from(await response.arrayBuffer());
