@@ -17,7 +17,7 @@ test('Pixabay search returns video hits and uses safesearch', async () => {
   const hits = await client.search('ocean water');
   assert.equal(hits.length, 1);
   assert.match(requested, /safesearch=true/);
-  assert.match(requested, /q=ocean+water/);
+  assert.match(requested, /q=ocean\+water/);
 });
 
 test('Pixabay chooses a relevant high-resolution clip and caches the local file', async t => {
