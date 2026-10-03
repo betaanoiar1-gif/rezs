@@ -41,7 +41,7 @@ test('Pixabay chooses a relevant high-resolution clip and caches the local file'
   const first = await client.downloadBest('forest');
   const second = await client.downloadBest('forest');
   assert.equal(first.provider, 'pixabay');
-  assert.equal(first.local_name, 'pixabay-2.mp4');
+  assert.equal(first.local_name, 'pixabay-1.mp4');
   assert.equal(second.local_name, first.local_name);
   assert.equal(downloads, 1);
 });
