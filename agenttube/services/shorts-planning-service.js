@@ -171,6 +171,7 @@ class ShortsPlanningService {
 
   async _getFoundation() {
     if (this.foundation) return this.foundation;
+    if (!this.database || typeof this.database.executeQuery !== 'function' || typeof this.database.getRow !== 'function') return null;
     if (!this.foundationPromise) {
       this.foundationPromise = (async () => {
         const service = new AICompanyFoundationService(this.database, { logger: this.logger });
