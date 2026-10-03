@@ -551,7 +551,7 @@ def concat_video_clips_with_ffmpeg(
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
 
-    def build_command(codec: str) -> list[str]:
+    def build_base_command() -> list[str]:
         command = [
             utils.get_ffmpeg_binary(),
             "-y",
@@ -561,42 +561,71 @@ def concat_video_clips_with_ffmpeg(
             "0",
             "-i",
             concat_list_file,
+        ]
+        if max_duration is not None and max_duration > 0:
+            command.extend(["-t", f"{max_duration:.3f}"])
+        return command
+
+    def build_copy_command() -> list[str]:
+        command = build_base_command()
+        command.extend(["-c", "copy", output_file])
+        return command
+
+    def build_encode_command(codec: str) -> list[str]:
+        command = build_base_command()
+        command.extend([
             "-c:v",
             codec,
             "-threads",
             str(threads or 2),
             "-pix_fmt",
             "yuv420p",
-        ]
-        if max_duration is not None and max_duration > 0:
-            command.extend(["-t", f"{max_duration:.3f}"])
-        command.append(output_file)
+            output_file,
+        ])
         return command
 
-    def run_concat(codec: str):
-        command = build_command(codec)
-        # 使用 ffmpeg 只做一次串联与编码，避免 MoviePy 逐段合并时反复重编码，
-        # 从而降低画质劣化与颜色偏移风险。阻塞等待期间由心跳日志体现任务仍在运行。
+    def run_command(command: list[str], description: str):
         result = _run_concat_with_heartbeat(command, output_file)
         if result.returncode != 0:
             error_message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(error_message or "ffmpeg concat failed")
-        return codec
+            raise RuntimeError(error_message or f"ffmpeg concat {description} failed")
+        return result
 
     try:
+        # Generated MPT clips are normalized before concat. When their streams are
+        # already compatible, stream-copy avoids a full 1080x1920 H.264 re-encode,
+        # which is both much faster and lossless. If copy is rejected by FFmpeg,
+        # fall back to the existing encoder path for heterogeneous inputs.
+        try:
+            run_command(build_copy_command(), "copy")
+            logger.info("ffmpeg concat completed with stream copy")
+            return "copy"
+        except TimeoutError:
+            # A timeout is not evidence of codec incompatibility. Do not spend a
+            # second timeout period retrying the same input.
+            raise
+        except Exception as copy_exc:
+            delete_files(output_file)
+            logger.info(
+                "ffmpeg concat stream copy unavailable; falling back to encoding: "
+                f"{copy_exc}"
+            )
+
         effective_codec = _get_effective_video_codec()
         try:
-            return run_concat(effective_codec)
+            run_command(build_encode_command(effective_codec), effective_codec)
+            return effective_codec
         except TimeoutError:
-            # A hung encoder is not evidence that another codec will work. Do
-            # not spend a second timeout period retrying the same input.
             raise
         except Exception as exc:
             if effective_codec == _DEFAULT_VIDEO_CODEC:
                 raise
-            result_codec = run_concat(_DEFAULT_VIDEO_CODEC)
+            delete_files(output_file)
+            result_codec = run_command(
+                build_encode_command(_DEFAULT_VIDEO_CODEC), _DEFAULT_VIDEO_CODEC
+            )
             _disable_runtime_video_codec(effective_codec, str(exc))
-            return result_codec
+            return _DEFAULT_VIDEO_CODEC
     finally:
         delete_files(concat_list_file)
 

@@ -1,4 +1,7 @@
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { recordAIArtifact } = require('./ai-company-adapter');
 
 class ProductionPreparationError extends Error {
   constructor(message, code = 'PRODUCTION_PREPARATION_FAILED', details = null) {
@@ -10,8 +13,9 @@ class ProductionPreparationError extends Error {
 }
 
 class ShortsProductionPreparationService {
-  constructor({ database } = {}) {
+  constructor({ database, materialDiscovery } = {}) {
     this.database = database;
+    this.materialDiscovery = materialDiscovery || discoverLocalVideoMaterials;
   }
 
   async prepare(planningJobId) {
@@ -44,9 +48,22 @@ class ShortsProductionPreparationService {
       });
     }
 
-    const specification = buildProductionSpecification(planningJob.artifact, preparationId);
+    const specification = await buildProductionSpecification(planningJob.artifact, preparationId, this.materialDiscovery);
     await this.database.updateShortsProductionPreparation(preparationId, {
       status: 'PRODUCTION_READY', quality_result: quality, specification
+    });
+    await recordAIArtifact({
+      database: this.database,
+      artifactId: `production_manifest_${preparationId}`,
+      artifactType: 'production_manifest',
+      producer: { agent_id: 'production-agent', layer: 'production' },
+      payload: {
+        preparation_id: preparationId,
+        planning_job_id: planningJob.job_id,
+        status: 'PRODUCTION_READY',
+        quality_result: quality,
+        specification
+      }
     });
     return this.database.getShortsProductionPreparation(preparationId);
   }
@@ -152,7 +169,7 @@ function validateProductionPlan(plan) {
   };
 }
 
-function buildProductionSpecification(plan, preparationId) {
+async function buildProductionSpecification(plan, preparationId, materialDiscovery = discoverLocalVideoMaterials) {
   const searchTerms = [...new Set(plan.scenes.flatMap(scene => scene.visual_search_terms).filter(string))];
   return {
     schema_version: 1,
@@ -175,9 +192,55 @@ function buildProductionSpecification(plan, preparationId) {
       video_subject: plan.topic,
       video_script: plan.script,
       video_terms: searchTerms,
-      video_aspect: '9:16'
+      video_aspect: '9:16',
+      voice_name: String(process.env.MPT_VOICE_NAME || 'en-US-JennyNeural').trim(),
+      voice_rate: Number.isFinite(Number(process.env.MPT_VOICE_RATE)) ? Number(process.env.MPT_VOICE_RATE) : 0.82,
+      voice_volume: Number.isFinite(Number(process.env.MPT_VOICE_VOLUME)) ? Number(process.env.MPT_VOICE_VOLUME) : 1.0,
+      video_source: 'local',
+      video_materials: await materialDiscovery(plan)
     }
   };
+}
+
+function discoverLocalVideoMaterials() {
+  const configuredDirectory = String(process.env.REZS_SHORTS_MATERIALS_DIR || '').trim();
+  const configuredManagedDirectory = String(process.env.REZS_MPT_LOCAL_VIDEOS_DIR || '').trim();
+  const managedDirectory = path.resolve(configuredManagedDirectory || path.resolve(__dirname, '../../moneyprinterturbo/storage/local_videos'));
+  const sourceDirectory = path.resolve(configuredDirectory || managedDirectory);
+  const allowed = new Set(['.mp4', '.mov', '.mkv', '.webm', '.avi', '.flv', '.jpg', '.jpeg', '.png']);
+
+  try {
+    const entries = fs.readdirSync(sourceDirectory, { withFileTypes: true });
+    const sourceFiles = entries
+      .filter(entry => entry.isFile() && allowed.has(path.extname(entry.name).toLowerCase()))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    fs.mkdirSync(managedDirectory, { recursive: true });
+
+    return sourceFiles.map(entry => {
+      const sourcePath = path.join(sourceDirectory, entry.name);
+      const sourceStat = fs.statSync(sourcePath);
+      const sameDirectory = path.resolve(sourceDirectory) === path.resolve(managedDirectory);
+      let managedName = entry.name;
+
+      if (!sameDirectory) {
+        const fingerprint = crypto
+          .createHash('sha256')
+          .update(`${sourcePath}:${sourceStat.size}:${sourceStat.mtimeMs}`)
+          .digest('hex')
+          .slice(0, 12);
+        managedName = `rezs-material-${fingerprint}-${entry.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        const managedPath = path.join(managedDirectory, managedName);
+        if (!fs.existsSync(managedPath) || fs.statSync(managedPath).size !== sourceStat.size) {
+          fs.copyFileSync(sourcePath, managedPath);
+        }
+      }
+
+      return { provider: 'local', url: managedName, duration: 0 };
+    });
+  } catch (_error) {
+    return [];
+  }
 }
 
 function string(value) { return typeof value === 'string' && value.trim().length > 0; }

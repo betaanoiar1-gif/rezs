@@ -37,10 +37,11 @@ class MemoryDatabase {
   async updateProductionJob(id, changes) { this.jobs.set(id, { ...this.jobs.get(id), ...changes }); return this.getProductionJob(id); }
 }
 
-function harness({ prep = preparation(), submitError, pollResult, validator, task, downloadError } = {}) {
+function harness({ prep = preparation(), submitError, pollResult, pollError, validator, task, downloadError } = {}) {
   const database = new MemoryDatabase(prep);
   let submissions = 0;
   let submittedSpecification;
+  let calibrationCalls = 0;
   const productionService = {
     client: null,
     submit: async (id, specification) => {
@@ -49,6 +50,11 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
       return database.updateProductionJob(id, { status: 'RUNNING', stage: 'RENDERING', mpt_task_id: 'mpt-task-1' });
     },
     poll: async id => {
+      if (pollError) {
+        const error = pollError;
+        pollError = null;
+        throw error;
+      }
       const result = pollResult || { status: 'SUCCEEDED', stage: 'RENDERED' };
       return database.updateProductionJob(id, result);
     },
@@ -57,12 +63,38 @@ function harness({ prep = preparation(), submitError, pollResult, validator, tas
       return database.updateProductionJob(id, { status: 'SUCCEEDED', stage: 'ARTIFACT_DOWNLOADED', artifact_reference: reference, artifact_path: '/safe/final.mp4' });
     }
   };
-  const client = { get_task_status: async () => task || ({ videos: ['/tasks/mpt-task-1/final-1.mp4'] }) };
+  const client = {
+    get_task_status: async () => task || ({ videos: ['/tasks/mpt-task-1/final-1.mp4'] }),
+    calibrate_voice_rate: async ({ video_script, voice_name, target_duration, video_language, initial_rate }) => {
+      calibrationCalls += 1;
+      return {
+      voice_rate: 0.91,
+      actual_duration: Number(target_duration),
+      target_duration: Number(target_duration),
+      error_seconds: 0,
+      iterations: 1,
+      within_tolerance: true,
+      calibration_input: {
+        video_script,
+        voice_name,
+        target_duration,
+        video_language,
+        initial_rate
+      }
+      };
+    }
+  };
   const service = new ShortsProductionExecutionService({
     database, client, productionService,
     artifactValidator: validator || (async () => ({ passed: true, file_size: 1234, duration_seconds: 70, resolution: '1080x1920', video_codec: 'h264', audio_codec: 'aac' }))
   });
-  return { database, service, submissions: () => submissions, submittedSpecification: () => submittedSpecification };
+  return {
+    database,
+    service,
+    submissions: () => submissions,
+    submittedSpecification: () => submittedSpecification,
+    calibrationCalls: () => calibrationCalls
+  };
 }
 
 test('PRODUCTION_READY preparation submits the exact approved MPT request', async () => {
@@ -71,8 +103,29 @@ test('PRODUCTION_READY preparation submits the exact approved MPT request', asyn
   const job = await h.service.start('short_prep_test');
   assert.equal(job.status, 'RUNNING');
   assert.equal(job.mpt_task_id, 'mpt-task-1');
-  assert.deepEqual(h.submittedSpecification(), approved.mpt_request);
+  const expectedRequest = {
+    ...approved.mpt_request,
+    voice_rate: 0.91
+  };
+  assert.deepEqual(h.submittedSpecification(), expectedRequest);
   assert.deepEqual(h.database.prep.specification, approved);
+});
+
+test('MPT_VOICE_RATE override bypasses adaptive calibration', async () => {
+  const previous = process.env.MPT_VOICE_RATE;
+  process.env.MPT_VOICE_RATE = '1.17';
+
+  try {
+    const h = harness();
+    const job = await h.service.start('short_prep_test');
+
+    assert.equal(job.status, 'RUNNING');
+    assert.equal(h.submittedSpecification().voice_rate, 1.17);
+    assert.equal(h.calibrationCalls(), 0);
+  } finally {
+    if (previous === undefined) delete process.env.MPT_VOICE_RATE;
+    else process.env.MPT_VOICE_RATE = previous;
+  }
 });
 
 test('REJECTED preparation cannot bypass Phase 3B', async () => {
@@ -100,6 +153,18 @@ test('successful submission persists RUNNING', async () => {
   const job = await h.service.start('short_prep_test');
   assert.equal(job.status, 'RUNNING');
   assert.equal((await h.service.get(job.job_id)).status, 'RUNNING');
+});
+
+test('lost MPT task is automatically resubmitted and recovered', async () => {
+  const lostTask = Object.assign(new Error('MPT task disappeared'), { code: 'MPT_TASK_NOT_FOUND' });
+  const h = harness({ pollError: lostTask });
+  const first = await h.service.start('short_prep_test');
+  const recovered = await h.service.execute(first.job_id);
+  assert.equal(recovered.status, 'SUCCEEDED');
+  assert.equal(recovered.stage, 'ARTIFACT_DOWNLOADED');
+  assert.equal(recovered.retry_count, 1);
+  assert.equal(h.submissions(), 2);
+  assert.equal(h.calibrationCalls(), 2);
 });
 
 test('MPT success downloads and validates the final artifact', async () => {
@@ -174,6 +239,53 @@ test('bounded polling timeout remains TIMEOUT', async () => {
   const job = await h.service.start('short_prep_test');
   await assert.rejects(h.service.execute(job.job_id), error => error.code === 'MPT_TIMEOUT');
   assert.equal((await h.database.getProductionJob(job.job_id)).status, 'TIMEOUT');
+});
+
+test('failed production retries the same job and submits a fresh MPT task', async () => {
+  const h = harness();
+  const first = await h.service.start('short_prep_test');
+  await h.database.updateProductionJob(first.job_id, {
+    status: 'FAILED',
+    stage: 'MPT_FAILED',
+    mpt_task_id: 'mpt-task-failed',
+    artifact_reference: '/api/v1/download/mpt-task-failed/final.mp4',
+    artifact_path: '/safe/failed.mp4',
+    validation_result: { passed: false },
+    last_error: 'previous render failed',
+    completed_at: '2026-09-28T00:00:00.000Z'
+  });
+
+  const retried = await h.service.start('short_prep_test');
+
+  assert.equal(retried.job_id, first.job_id);
+  assert.equal(retried.status, 'RUNNING');
+  assert.equal(retried.stage, 'RENDERING');
+  assert.equal(retried.mpt_task_id, 'mpt-task-1');
+  assert.equal(retried.retried, true);
+  assert.equal(retried.retry_count, 1);
+  assert.equal(h.submissions(), 2);
+  assert.equal(retried.last_error, null);
+  assert.equal(retried.artifact_reference, null);
+  assert.equal(retried.artifact_path, null);
+  assert.equal(retried.validation_result, null);
+  assert.equal(retried.completed_at, null);
+  assert.equal(h.database.jobs.size, 1);
+});
+
+test('cancelled and timed-out productions are retryable without creating a second job', async () => {
+  for (const status of ['CANCELLED', 'TIMEOUT']) {
+    const h = harness();
+    const first = await h.service.start('short_prep_test');
+    await h.database.updateProductionJob(first.job_id, { status, stage: status, mpt_task_id: 'old-task' });
+
+    const retried = await h.service.start('short_prep_test');
+
+    assert.equal(retried.job_id, first.job_id);
+    assert.equal(retried.status, 'RUNNING');
+    assert.equal(retried.retried, true);
+    assert.equal(h.submissions(), 2);
+    assert.equal(h.database.jobs.size, 1);
+  }
 });
 
 test('existing production reuses one job and never submits a second MPT task', async () => {

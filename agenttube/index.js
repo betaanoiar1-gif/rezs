@@ -27,11 +27,14 @@ const { AudienceEngagementService } = require('./utils/audience-engagement-servi
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { AICompanyFoundationService } = require('./services/ai-company-foundation-service');
+const { registerAll: registerAICompanyAgents } = require('./config/ai-company-agent-registry');
 const { ShortsPlanningService, PlanningError } = require('./services/shorts-planning-service');
 const { ShortsProductionPreparationService, ProductionPreparationError } = require('./services/shorts-production-preparation-service');
 const { ShortsProductionExecutionService, ShortsProductionExecutionError } = require('./services/shorts-production-execution-service');
 const { ShortsReviewService, ShortsReviewError } = require('./services/shorts-review-service');
 const { MoneyPrinterTurboClient, MoneyPrinterTurboProductionService } = require('./integrations/moneyprinterturbo');
+const { PixabayVideoClient, PixabayError } = require('./integrations/pixabay');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -56,6 +59,7 @@ class YouTubeAutomationAgent {
     this.engagement = null;
     this.experiments = null;
     this.discoverability = null;
+    this.aiCompany = null;
     this.setupRequired = false;
   }
 
@@ -69,6 +73,13 @@ class YouTubeAutomationAgent {
       this.db = new Database();
       await this.db.initialize();
       await this.db.markInterruptedJobs();
+
+      // Foundation is metadata/orchestration state only. It does not alter
+      // MPT, TTS, scene fetching, rendering, validation, or publishing behavior.
+      this.aiCompany = new AICompanyFoundationService(this.db, { logger: this.logger });
+      await this.aiCompany.initialize();
+      await registerAICompanyAgents(this.aiCompany);
+
       this.recovery = new GenerationRecoveryService(this.db, {
         logger: this.logger,
         updateJobStage: (...args) => this.updateJobStage(...args)
@@ -182,26 +193,38 @@ class YouTubeAutomationAgent {
     const creds = this.credentials.credentials || {};
 
     const hasText = this.credentials.hasAITextProvider();
-    const hasGemini = Boolean(creds.gemini?.apiKey || process.env.GEMINI_API_KEY);
-    const hasImages = Boolean(creds.openai?.apiKey || process.env.OPENAI_API_KEY || hasGemini);
-    const hasTTS = Boolean(
-      creds.openai?.apiKey || process.env.OPENAI_API_KEY ||
-      creds.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY ||
-      creds.azureSpeech?.subscriptionKey || process.env.AZURE_SPEECH_KEY ||
-      hasGemini
-    );
     const hasFFmpeg = await checkFFmpeg();
     const hasUpload = Boolean(creds.youtube && this.credentials.tokens?.youtube);
 
     const capabilities = [
-      { name: 'Script & strategy generation', ok: hasText, hint: 'configure an AI provider (npm run credentials:setup)' },
-      { name: 'Image generation (visuals/thumbnails)', ok: hasImages, hint: 'requires an OpenAI or Gemini API key — otherwise gradient slides are used' },
-      { name: 'Voice narration (TTS)', ok: hasTTS, hint: 'configure OpenAI, Gemini, ElevenLabs, or Azure Speech — otherwise videos are silent' },
-      { name: 'Video assembly (FFmpeg)', ok: hasFFmpeg, hint: ffmpegInstallHint() },
-      { name: 'YouTube upload', ok: hasUpload, hint: 'run: npm run credentials:setup' }
+      {
+        name: 'Script & strategy generation',
+        ok: hasText,
+        hint: 'configure an AI text provider'
+      },
+      {
+        name: 'Source-based scene production',
+        ok: true,
+        hint: 'scenes use approved source/search assets'
+      },
+      {
+        name: 'Voice narration (MPT embedded TTS)',
+        ok: true,
+        hint: 'MoneyPrinterTurbo embedded narration is required for Shorts production'
+      },
+      {
+        name: 'Video assembly (FFmpeg)',
+        ok: hasFFmpeg,
+        hint: ffmpegInstallHint()
+      },
+      {
+        name: 'YouTube upload',
+        ok: hasUpload,
+        hint: 'run: npm run credentials:setup'
+      }
     ];
 
-    console.log(chalk.cyan('\n🔎 Capability check:'));
+    console.log(chalk.cyan('\n🔎 Production capabilities:'));
     for (const cap of capabilities) {
       if (cap.ok) {
         console.log(chalk.green(`  ✓ ${cap.name}`));
@@ -213,10 +236,10 @@ class YouTubeAutomationAgent {
     if (!hasFFmpeg) {
       this.logger.warn('FFmpeg is missing: no .mp4 files can be produced until it is installed.');
     }
-    console.log('');
-    return { hasText, hasImages, hasTTS, hasFFmpeg, hasUpload };
-  }
 
+    console.log('');
+    return { hasText, hasFFmpeg, hasUpload };
+  }
   requireAPIKey() {
     return (req, res, next) => {
       if (!process.env.API_KEY) {
@@ -525,13 +548,66 @@ class YouTubeAutomationAgent {
 
     this.app.post('/api/planning/shorts/:jobId/prepare-production', protect, async (req, res) => {
       try {
-        const service = new ShortsProductionPreparationService({ database: this.db });
+        const pixabay = new PixabayVideoClient();
+        const service = new ShortsProductionPreparationService({
+          database: this.db,
+          materialDiscovery: async plan => {
+            const terms = [...new Set(
+              (plan.scenes || []).flatMap(scene => scene.visual_search_terms || [])
+                .filter(term => typeof term === 'string' && term.trim())
+            )].slice(0, 8);
+
+            // Pixabay performs best with concrete, visually searchable phrases.
+            // AI-generated scene terms can contain abstract concepts such as
+            // "consistency" or "self-discipline", so try deterministic visual
+            // fallbacks instead of failing the whole preparation on one term.
+            const visualSearchCandidates = term => {
+              const normalized = String(term).trim().toLowerCase();
+              const fallbacks = {
+                consistency: ['daily habit', 'habit formation', 'person exercising', 'morning routine'],
+                'self discipline': ['person exercising', 'morning routine', 'focused person', 'daily routine'],
+                discipline: ['person exercising', 'focused person', 'daily routine'],
+                motivation: ['person exercising', 'success goal', 'morning routine'],
+                'personal growth': ['person learning', 'person exercising', 'success goal'],
+                productivity: ['working at desk', 'daily routine', 'focused person']
+              };
+              return [...new Set([term, ...(fallbacks[normalized] || []), `${term} habit`, `${term} routine`])];
+            };
+
+            const assets = [];
+            const attemptedTerms = [];
+            for (const term of terms) {
+              let asset = null;
+              for (const candidate of visualSearchCandidates(term)) {
+                attemptedTerms.push(candidate);
+                try {
+                  asset = await pixabay.downloadBest(candidate, { perPage: 8, safesearch: true });
+                  if (asset) break;
+                } catch (error) {
+                  if (error.code !== 'NO_VIDEO_RESULTS') throw error;
+                }
+              }
+              if (asset) assets.push(asset);
+            }
+
+            if (!assets.length) {
+              const error = new Error(`No usable Pixabay video found for visual terms: ${attemptedTerms.join(', ')}`);
+              error.code = 'NO_VIDEO_RESULTS';
+              throw error;
+            }
+            return assets.map(asset => ({
+              provider: 'local',
+              url: asset.local_name,
+              duration: asset.duration || 0
+            }));
+          }
+        });
         const preparation = await service.prepare(req.params.jobId);
         return res.status(200).json({ success: true, preparation });
       } catch (error) {
         const status = error.code === 'PLANNING_JOB_NOT_FOUND' ? 404
           : error.code === 'INVALID_PLANNING_JOB_ID' ? 400
-            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED'].includes(error.code) ? 422 : 500;
+            : ['PLANNING_JOB_NOT_READY', 'QUALITY_GATE_FAILED', 'PIXABAY_API_KEY_MISSING', 'NO_VIDEO_RESULTS'].includes(error.code) ? 422 : error instanceof PixabayError ? 502 : 500;
         return res.status(status).json({
           success: false,
           error: { code: error.code || 'PRODUCTION_PREPARATION_FAILED', message: error.message, details: error instanceof ProductionPreparationError ? error.details : null }

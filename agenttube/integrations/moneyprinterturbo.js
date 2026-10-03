@@ -19,7 +19,7 @@ class MptError extends Error {
 
 class MoneyPrinterTurboClient {
   constructor(options = {}) {
-    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8080').replace(/\/$/, '');
+    this.baseUrl = String(options.baseUrl || process.env.MPT_BASE_URL || 'http://127.0.0.1:8090').replace(/\/$/, '');
     this.connectTimeoutMs = positive(options.connectTimeoutMs ?? process.env.MPT_CONNECT_TIMEOUT_MS, 5000);
     this.readTimeoutMs = positive(options.readTimeoutMs ?? process.env.MPT_READ_TIMEOUT_MS, 30000);
     this.maxRetries = nonnegative(options.maxRetries ?? process.env.MPT_MAX_RETRIES, 2);
@@ -54,10 +54,185 @@ class MoneyPrinterTurboClient {
     return { ...task, lifecycle_status: mapMptState(task) };
   }
 
+  async create_audio(specification) {
+    if (!specification || typeof specification !== 'object' || Array.isArray(specification)) {
+      throw new MptError('Audio specification must be an object', { code: 'INVALID_REQUEST' });
+    }
+    const response = await this._request('/api/v1/audio', { method: 'POST', body: specification });
+    const taskId = response?.data?.task_id;
+    if (!taskId) throw new MptError('MPT audio response did not contain a task_id', { code: 'INVALID_RESPONSE' });
+    return { task_id: taskId, native: response };
+  }
+
   async cancel_task(taskId) {
     requireTaskId(taskId);
     await this._request(`/api/v1/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
     return { task_id: taskId, status: 'CANCELLED' };
+  }
+
+  async calibrate_voice_rate({
+    video_script,
+    voice_name,
+    target_duration,
+    initial_rate = 0.82,
+    tolerance_seconds = 0.5,
+    max_iterations = 3,
+    min_rate = 0.5,
+    max_rate = 2.0,
+    video_language = 'en',
+  } = {}) {
+    if (typeof video_script !== 'string' || !video_script.trim()) {
+      throw new MptError('Calibration video_script is required', { code: 'INVALID_REQUEST' });
+    }
+
+    const target = Number(target_duration);
+    if (!Number.isFinite(target) || target <= 0) {
+      throw new MptError('Calibration target_duration must be positive', { code: 'INVALID_REQUEST' });
+    }
+
+    let rate = Number(initial_rate);
+    if (!Number.isFinite(rate) || rate <= 0) rate = 0.82;
+
+    const tolerance = Number.isFinite(Number(tolerance_seconds))
+      ? Math.max(0.05, Number(tolerance_seconds))
+      : 0.5;
+
+    const iterations = Math.max(1, Math.min(5, Math.floor(Number(max_iterations) || 3)));
+    const lower = Math.max(0.1, Number(min_rate) || 0.5);
+    const upper = Math.max(lower, Number(max_rate) || 2.0);
+
+    rate = Math.min(upper, Math.max(lower, rate));
+
+    let best = null;
+
+    for (let iteration = 1; iteration <= iterations; iteration += 1) {
+      const result = await this.create_audio({
+        video_script,
+        video_language,
+        voice_name,
+        voice_volume: 1.0,
+        voice_rate: Number(rate.toFixed(4)),
+        bgm_type: 'none',
+        bgm_file: '',
+        bgm_volume: 0.0,
+        video_source: 'local',
+      });
+
+      const taskId = result.task_id;
+      let audioReference = null;
+
+      for (let poll = 0; poll < 60; poll += 1) {
+        const task = await this.get_task_status(taskId);
+        audioReference = task?.audio_file || null;
+
+        if (audioReference) break;
+
+        if (task?.lifecycle_status === 'FAILED' || task?.lifecycle_status === 'CANCELLED') {
+          throw new MptError(
+            task.error || `MPT audio calibration task ${taskId} failed`,
+            { code: 'MPT_AUDIO_FAILED' }
+          );
+        }
+
+        await sleep(1000);
+      }
+
+      if (!audioReference) {
+        throw new MptError(
+          `MPT audio calibration task ${taskId} did not produce audio_file`,
+          { code: 'MPT_AUDIO_TIMEOUT', transient: true }
+        );
+      }
+
+      const taskDir = path.resolve(
+        process.env.MPT_STORAGE_DIR || path.resolve(__dirname, '..', '..', 'moneyprinterturbo', 'storage', 'tasks'),
+        taskId
+      );
+
+      const audioPath = path.join(taskDir, 'audio.mp3');
+
+      let actualDuration = 0;
+      for (let check = 0; check < 20; check += 1) {
+        try {
+          const stat = await fsp.stat(audioPath);
+          if (stat.isFile() && stat.size > 0) {
+            const { execFile } = require('child_process');
+            const duration = await new Promise((resolve, reject) => {
+              execFile(
+                'ffprobe',
+                [
+                  '-v', 'error',
+                  '-show_entries', 'format=duration',
+                  '-of', 'default=noprint_wrappers=1:nokey=1',
+                  audioPath,
+                ],
+                { timeout: 15000 },
+                (error, stdout) => {
+                  if (error) return reject(error);
+                  resolve(Number.parseFloat(String(stdout).trim()));
+                }
+              );
+            });
+
+            if (Number.isFinite(duration) && duration > 0) {
+              actualDuration = duration;
+              break;
+            }
+          }
+        } catch {
+          // MPT may still be finalizing the file.
+        }
+        await sleep(250);
+      }
+
+      if (!(actualDuration > 0)) {
+        throw new MptError(
+          `Unable to measure calibrated MPT audio task ${taskId}`,
+          { code: 'MPT_AUDIO_DURATION_UNAVAILABLE' }
+        );
+      }
+
+      const errorSeconds = actualDuration - target;
+      const absoluteError = Math.abs(errorSeconds);
+
+      const sample = {
+        iteration,
+        rate: Number(rate.toFixed(4)),
+        duration: Number(actualDuration.toFixed(3)),
+        target_duration: Number(target.toFixed(3)),
+        error_seconds: Number(errorSeconds.toFixed(3)),
+      };
+
+      if (!best || Math.abs(sample.error_seconds) < Math.abs(best.error_seconds)) {
+        best = sample;
+      }
+
+      this.logger.info(
+        `MPT voice calibration ${iteration}/${iterations}: ` +
+        `rate=${sample.rate}, duration=${sample.duration}s, ` +
+        `target=${sample.target_duration}s, error=${sample.error_seconds}s`
+      );
+
+      if (absoluteError <= tolerance) break;
+
+      const corrected = rate * (actualDuration / target);
+      rate = Math.min(upper, Math.max(lower, corrected));
+    }
+
+    if (!best) {
+      throw new MptError('Voice calibration produced no measurement', {
+        code: 'MPT_CALIBRATION_FAILED',
+      });
+    }
+
+    return {
+      voice_rate: best.rate,
+      actual_duration: best.duration,
+      target_duration: best.target_duration,
+      error_seconds: best.error_seconds,
+      iterations: best.iteration,
+      within_tolerance: Math.abs(best.error_seconds) <= tolerance,
+    };
   }
 
   async download_artifact(artifactReference, destination) {
@@ -134,7 +309,10 @@ class MoneyPrinterTurboClient {
         const response = await this._fetchOnce(url, options);
         if (!response.ok) {
           const transient = response.status === 408 || response.status === 429 || response.status >= 500;
-          throw new MptError(`MPT request failed with HTTP ${response.status}`, { code: 'HTTP_ERROR', status: response.status, transient });
+          const code = response.status === 404 && /\/api\/v1\/tasks\//.test(url)
+            ? 'MPT_TASK_NOT_FOUND'
+            : 'HTTP_ERROR';
+          throw new MptError(`MPT request failed with HTTP ${response.status}`, { code, status: response.status, transient });
         }
         if (options.raw) return response;
         const text = await this._readText(response);
@@ -234,7 +412,8 @@ class MoneyPrinterTurboProductionService {
   async downloadArtifact(jobId, artifactReference, filename = 'final.mp4') {
     const job = await this.database.getProductionJob(jobId);
     if (!job || job.status !== 'SUCCEEDED') throw new MptError('Only successful production jobs can download artifacts', { code: 'INVALID_JOB' });
-    const relativePath = path.join(jobId, filename);
+    const attemptId = String(job.mpt_task_id || `retry-${job.retry_count || 0}`);
+    const relativePath = path.join(jobId, attemptId, filename);
     const artifact = await this.client.download_artifact(artifactReference, relativePath);
     return this.database.updateProductionJob(jobId, { stage: 'ARTIFACT_DOWNLOADED', artifact_path: artifact.path, last_error: null });
   }

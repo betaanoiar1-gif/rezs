@@ -2760,13 +2760,20 @@ class SystemTest {
 
     // Every guided provider must be complete and coherent
     for (const [id, guide] of Object.entries(AI_PROVIDER_GUIDE)) {
-      for (const field of ['label', 'keyUrl', 'instructions', 'models', 'defaultModel', 'save', 'validationCreds']) {
+      for (const field of ['label', 'keyUrl', 'instructions', 'models', 'save', 'validationCreds']) {
         if (!guide[field]) {
           throw new Error(`Provider guide "${id}" is missing "${field}"`);
         }
       }
-      if (!guide.models.includes(guide.defaultModel)) {
-        throw new Error(`Provider guide "${id}" default model is not in its model list`);
+
+      if (guide.dynamicModel === true) {
+        if (guide.defaultModel !== null) {
+          throw new Error(`Dynamic provider guide "${id}" must not define a static default model`);
+        }
+      } else {
+        if (!guide.defaultModel || !guide.models.includes(guide.defaultModel)) {
+          throw new Error(`Provider guide "${id}" default model is not in its model list`);
+        }
       }
 
       // save() must produce credentials that pass validation
@@ -2804,7 +2811,15 @@ class SystemTest {
     }
 
     for (const id of Object.keys(PROVIDERS)) {
-      if (JSON.stringify(AI_PROVIDER_GUIDE[id].models) !== JSON.stringify(PROVIDERS[id].models)) {
+      const guide = AI_PROVIDER_GUIDE[id];
+      if (!guide) {
+        throw new Error(`Walkthrough is missing AI provider "${id}"`);
+      }
+      if (PROVIDERS[id].modelEnvKey) {
+        if (guide.dynamicModel !== true || guide.defaultModel !== null || guide.models.length !== 0) {
+          throw new Error(`Walkthrough dynamic provider "${id}" is not configured correctly`);
+        }
+      } else if (JSON.stringify(guide.models) !== JSON.stringify(PROVIDERS[id].models)) {
         throw new Error(`Walkthrough provider "${id}" models drifted from the runtime catalog`);
       }
     }

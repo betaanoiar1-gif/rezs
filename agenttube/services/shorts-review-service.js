@@ -1,6 +1,7 @@
 const fs = require('fs').promises;
 const { OperatorService } = require('../utils/operator-service');
 const { validateVideoArtifact, hashFileSha256 } = require('./shorts-production-execution-service');
+const { recordAIArtifact, getAICompanyFoundation } = require('./ai-company-adapter');
 
 const DECISIONS = new Set(['approve', 'reject', 'request-changes']);
 
@@ -51,6 +52,20 @@ class ShortsReviewService {
       qualityChecks: quality.checks,
       reviewNotes: quality.passed ? null : `Blocking checks require human review: ${quality.blockingFailures.join(', ')}`,
       reviewedAt: null
+    });
+    await recordAIArtifact({
+      database: this.database,
+      artifactId: `quality_report_${productionJobId}`,
+      artifactType: 'quality_report',
+      producer: { agent_id: 'quality-control', layer: 'qa' },
+      payload: {
+        production_job_id: productionJobId,
+        review_status: status,
+        passed: quality.passed === true,
+        checks: quality.checks || [],
+        blocking_failures: quality.blockingFailures || [],
+        review_notes: quality.passed ? null : `Blocking checks require human review: ${quality.blockingFailures.join(', ')}`
+      }
     });
     return this.reviewResponse(reviewed, chain);
   }
@@ -226,10 +241,39 @@ class ShortsReviewService {
         review,
         sceneIds: (bundle.scenes || []).map(scene => scene.id)
       });
+      await recordAIArtifact({
+        database: this.database,
+        artifactId: `quality_report_${productionJobId}`,
+        artifactType: 'quality_report',
+        producer: { agent_id: 'quality-control', layer: 'qa' },
+        payload: {
+          production_job_id: productionJobId,
+          review_status: 'approved',
+          passed: true,
+          checks: review.qualityChecks || [],
+          final_approval_gate: editorData.finalApprovalGate
+        }
+      });
+      const foundation = await getAICompanyFoundation(this.database);
+      if (foundation) await foundation.setReleaseGate({
+        gateId: `release_${productionJobId}`,
+        productionId: productionJobId,
+        status: 'approved',
+        checks: review.qualityChecks || [],
+        blockingReasons: []
+      });
       return this.reviewResponse(result, chain);
     }
     const result = await this.database.saveContentReview(productionJobId, review);
     await this.database.updateProductionStatus(productionJobId, target);
+    const foundation = await getAICompanyFoundation(this.database);
+    if (foundation) await foundation.setReleaseGate({
+      gateId: `release_${productionJobId}`,
+      productionId: productionJobId,
+      status: 'blocked',
+      checks: review.qualityChecks || [],
+      blockingReasons: [notes]
+    });
     return this.reviewResponse(result, chain);
   }
 
