@@ -267,7 +267,7 @@ class ShortsReviewService {
     const result = await this.database.saveContentReview(productionJobId, review);
     await this.database.updateProductionStatus(productionJobId, target);
     const foundation = await getAICompanyFoundation(this.database);
-    await foundation.setReleaseGate({
+    if (foundation) await foundation.setReleaseGate({
       gateId: `release_${productionJobId}`,
       productionId: productionJobId,
       status: 'blocked',
