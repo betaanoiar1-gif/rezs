@@ -5,7 +5,7 @@ const { createArtifact } = require('../schemas/ai-company-artifacts');
 const foundationCache = new WeakMap();
 
 async function getAICompanyFoundation(database) {
-  if (!database) return null;
+  if (!database || typeof database.executeQuery !== 'function' || typeof database.getRow !== 'function') return null;
   let foundation = foundationCache.get(database);
   if (!foundation) {
     foundation = new AICompanyFoundationService(database);
@@ -25,6 +25,8 @@ async function recordAIArtifact({
   parentArtifactIds = []
 }) {
   const foundation = await getAICompanyFoundation(database);
+  if (!foundation) return null;
+
   if (!foundation) return null;
 
   const runId = await foundation.startRun({
