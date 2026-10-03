@@ -255,7 +255,7 @@ class ShortsReviewService {
         }
       });
       const foundation = await getAICompanyFoundation(this.database);
-      await foundation.setReleaseGate({
+      if (foundation) await foundation.setReleaseGate({
         gateId: `release_${productionJobId}`,
         productionId: productionJobId,
         status: 'approved',
