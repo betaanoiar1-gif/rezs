@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { recordAIArtifact } = require('./ai-company-adapter');
 
 class ProductionPreparationError extends Error {
   constructor(message, code = 'PRODUCTION_PREPARATION_FAILED', details = null) {
@@ -50,6 +51,19 @@ class ShortsProductionPreparationService {
     const specification = await buildProductionSpecification(planningJob.artifact, preparationId, this.materialDiscovery);
     await this.database.updateShortsProductionPreparation(preparationId, {
       status: 'PRODUCTION_READY', quality_result: quality, specification
+    });
+    await recordAIArtifact({
+      database: this.database,
+      artifactId: `production_manifest_${preparationId}`,
+      artifactType: 'production_manifest',
+      producer: { agent_id: 'production-agent', layer: 'production' },
+      payload: {
+        preparation_id: preparationId,
+        planning_job_id: planningJob.job_id,
+        status: 'PRODUCTION_READY',
+        quality_result: quality,
+        specification
+      }
     });
     return this.database.getShortsProductionPreparation(preparationId);
   }
