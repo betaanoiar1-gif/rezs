@@ -61,7 +61,7 @@ test('video submission uses the verified MPT endpoint and returns task ID', asyn
   const client = clientWith(async (url, options) => { request = { url, options }; return response(200, { data: { task_id: 'task-1' } }); });
   const result = await client.create_video({ video_subject: 'Subject' });
   assert.equal(result.task_id, 'task-1');
-  assert.equal(request.url, 'http://127.0.0.1:8080/api/v1/videos');
+  assert.equal(request.url, 'http://127.0.0.1:8090/api/v1/videos');
   assert.equal(JSON.parse(request.options.body).video_subject, 'Subject');
 });
 
@@ -116,7 +116,7 @@ test('transient responses retry but permanent responses do not', async () => {
 test('artifact download is non-empty and stays inside configured directory', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mpt-artifacts-'));
   const client = clientWith(async url => {
-    assert.equal(url, 'http://127.0.0.1:8080/api/v1/download/tasks/task/final.mp4');
+    assert.equal(url, 'http://127.0.0.1:8090/api/v1/download/tasks/task/final.mp4');
     return response(200, Buffer.from('video'), true);
   }, { artifactDir: root });
   const artifact = await client.download_artifact('/tasks/task/final.mp4', 'job/final.mp4');
